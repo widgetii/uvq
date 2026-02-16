@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import os
+import tempfile
 import urllib.request
 
 import gradio as gr
@@ -103,7 +104,7 @@ def extract_metadata(video_path):
     }
 
 
-def run_inference(video_path, progress=gr.Progress()):
+def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
     """Run both UVQ 1.5 and UVQ 1.0 on a video. Returns outputs for the UI."""
 
     progress(0.05, desc="Extracting video metadata...")
@@ -124,26 +125,55 @@ def run_inference(video_path, progress=gr.Progress()):
     sample_fps = 1  # UVQ 1.5 default
 
     # --- UVQ 1.5 ---
-    progress(0.10, desc="Running UVQ 1.5 inference...")
-    results_1p5 = model_1p5.infer(
-        video_path,
-        video_length,
-        transpose,
-        fps=sample_fps,
-        orig_fps=orig_fps,
-        device=device,
-    )
+    gradcam_1p5 = None
+    gradcam_1p0 = None
+
+    if enable_gradcam:
+        gradcam_dir_1p5 = tempfile.mkdtemp(prefix="uvq_gradcam_1p5_")
+        progress(0.10, desc="Running UVQ 1.5 inference with Grad-CAM...")
+        results_1p5 = model_1p5.infer_gradcam(
+            video_path,
+            video_length,
+            transpose,
+            output_dir=gradcam_dir_1p5,
+            fps=sample_fps,
+            orig_fps=orig_fps,
+            device=device,
+        )
+        gradcam_1p5 = results_1p5.get("gradcam_files", [])
+    else:
+        progress(0.10, desc="Running UVQ 1.5 inference...")
+        results_1p5 = model_1p5.infer(
+            video_path,
+            video_length,
+            transpose,
+            fps=sample_fps,
+            orig_fps=orig_fps,
+            device=device,
+        )
 
     # --- UVQ 1.0 ---
-    progress(0.55, desc="Running UVQ 1.0 inference...")
-    results_1p0 = model_1p0.infer(video_path, video_length, transpose)
-    results_1p0 = {k: float(v) for k, v in results_1p0.items()}
+    if enable_gradcam:
+        gradcam_dir_1p0 = tempfile.mkdtemp(prefix="uvq_gradcam_1p0_")
+        progress(0.55, desc="Running UVQ 1.0 inference with Grad-CAM...")
+        results_1p0 = model_1p0.infer_gradcam(
+            video_path, video_length, transpose, output_dir=gradcam_dir_1p0,
+        )
+        gradcam_1p0 = results_1p0.get("gradcam_files", [])
+        # Ensure numeric values for score display (gradcam results may include lists)
+        results_1p0_scores = {
+            k: float(v) for k, v in results_1p0.items() if k != "gradcam_files"
+        }
+    else:
+        progress(0.55, desc="Running UVQ 1.0 inference...")
+        results_1p0 = model_1p0.infer(video_path, video_length, transpose)
+        results_1p0_scores = {k: float(v) for k, v in results_1p0.items()}
 
     progress(0.90, desc="Generating visualizations...")
 
     # --- Build outputs ---
     score_1p5 = results_1p5["uvq1p5_score"]
-    score_1p0_combined = results_1p0["compression_content_distortion"]
+    score_1p0_combined = results_1p0_scores["compression_content_distortion"]
 
     meta_md = (
         f"| Property | Value |\n|---|---|\n"
@@ -154,10 +184,10 @@ def run_inference(video_path, progress=gr.Progress()):
     )
 
     temporal_plot = make_temporal_plot(results_1p5, sample_fps)
-    dimensions_plot = make_dimensions_plot(results_1p0)
+    dimensions_plot = make_dimensions_plot(results_1p0_scores)
 
     full_json = json.dumps(
-        {"uvq1p5": results_1p5, "uvq1p0": results_1p0},
+        {"uvq1p5": results_1p5, "uvq1p0": results_1p0_scores},
         indent=2,
         default=str,
     )
@@ -171,6 +201,8 @@ def run_inference(video_path, progress=gr.Progress()):
         temporal_plot,    # temporal chart
         dimensions_plot,  # dimensions bar chart
         full_json,        # raw JSON
+        gradcam_1p5,      # Grad-CAM gallery for UVQ 1.5
+        gradcam_1p0,      # Grad-CAM gallery for UVQ 1.0
     )
 
 
@@ -236,20 +268,20 @@ def make_dimensions_plot(results_1p0):
 # Gradio UI callbacks
 # ---------------------------------------------------------------------------
 
-def analyze_upload(video_file, progress=gr.Progress()):
+def analyze_upload(video_file, enable_gradcam, progress=gr.Progress()):
     """Callback for the Upload tab."""
     if video_file is None:
         raise gr.Error("Please upload a video first.")
-    return run_inference(video_file, progress)
+    return run_inference(video_file, enable_gradcam, progress)
 
 
-def analyze_demo(demo_name, progress=gr.Progress()):
+def analyze_demo(demo_name, enable_gradcam, progress=gr.Progress()):
     """Callback for the Demo tab."""
     if not demo_name:
         raise gr.Error("Please select a demo video.")
     filename = DEMO_VIDEOS[demo_name]
     local_path = download_demo(filename, progress)
-    return run_inference(local_path, progress)
+    return run_inference(local_path, enable_gradcam, progress)
 
 
 # ---------------------------------------------------------------------------
@@ -273,12 +305,18 @@ def build_app():
         with gr.Tabs():
             with gr.TabItem("Upload Video"):
                 upload_input = gr.Video(label="Upload a video file")
+                upload_gradcam = gr.Checkbox(
+                    label="Generate Grad-CAM heatmaps", value=False,
+                )
                 upload_btn = gr.Button("Analyze", variant="primary")
 
             with gr.TabItem("Demo Videos (YouTube-UGC)"):
                 demo_dropdown = gr.Dropdown(
                     choices=list(DEMO_VIDEOS.keys()),
                     label="Select a demo video",
+                )
+                demo_gradcam = gr.Checkbox(
+                    label="Generate Grad-CAM heatmaps", value=False,
                 )
                 demo_btn = gr.Button("Load & Analyze", variant="primary")
 
@@ -295,6 +333,14 @@ def build_app():
         temporal_chart = gr.Plot(label="Temporal Quality (UVQ 1.5)")
         dimensions_chart = gr.Plot(label="Quality Dimensions (UVQ 1.0)")
 
+        with gr.Accordion("Grad-CAM Heatmaps", open=True):
+            gradcam_gallery_1p5 = gr.Gallery(
+                label="Grad-CAM: Distortion Heatmap (UVQ 1.5)", columns=2,
+            )
+            gradcam_gallery_1p0 = gr.Gallery(
+                label="Grad-CAM: Distortion Heatmap (UVQ 1.0)", columns=2,
+            )
+
         with gr.Accordion("Full JSON Output", open=False):
             json_output = gr.Code(language="json", label="Raw results")
 
@@ -306,10 +352,20 @@ def build_app():
             temporal_chart,
             dimensions_chart,
             json_output,
+            gradcam_gallery_1p5,
+            gradcam_gallery_1p0,
         ]
 
-        upload_btn.click(fn=analyze_upload, inputs=[upload_input], outputs=outputs)
-        demo_btn.click(fn=analyze_demo, inputs=[demo_dropdown], outputs=outputs)
+        upload_btn.click(
+            fn=analyze_upload,
+            inputs=[upload_input, upload_gradcam],
+            outputs=outputs,
+        )
+        demo_btn.click(
+            fn=analyze_demo,
+            inputs=[demo_dropdown, demo_gradcam],
+            outputs=outputs,
+        )
 
     return demo
 
