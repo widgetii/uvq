@@ -108,17 +108,17 @@ class ContentNetInference:
         self.model.load_state_dict(model)
         return model
 
-    def predict(self, frame):
+    def predict(self, frame, device="cpu"):
         with torch.no_grad():
-            _, label_probs = self.model(torch.Tensor(np.expand_dims(frame, 0)))
-        return label_probs.detach().numpy()
+            _, label_probs = self.model(torch.from_numpy(np.expand_dims(frame, 0)).float().to(device))
+        return label_probs.detach().cpu().numpy()
 
-    def predict_and_get_features(self, frame) -> tuple[np.ndarray, np.ndarray]:
+    def predict_and_get_features(self, frame, device="cpu") -> tuple[np.ndarray, np.ndarray]:
         with torch.no_grad():
-            features, label_probs = self.model(torch.Tensor(np.expand_dims(frame, 0)))
+            features, label_probs = self.model(torch.from_numpy(np.expand_dims(frame, 0)).float().to(device))
         return (
-            features.detach().numpy().transpose(*self.features_transpose),
-            label_probs.detach().numpy()[0],
+            features.detach().cpu().numpy().transpose(*self.features_transpose),
+            label_probs.detach().cpu().numpy()[0],
         )
 
     def load_labels_df(self, csv_path) -> pd.DataFrame:
@@ -151,7 +151,7 @@ class ContentNetInference:
         )
 
     def get_labels_and_features_for_all_frames(
-        self, video: np.ndarray
+        self, video: np.ndarray, device="cpu"
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Gets the predicted labels and features for all frames(seconds) in a video.
@@ -178,7 +178,7 @@ class ContentNetInference:
 
         for k in range(video.shape[0]):
             frame_features, frame_labels = self.predict_and_get_features(
-                video[k, 0, :, :, :]
+                video[k, 0, :, :, :], device=device
             )
 
             feature[k, :, :, :] = frame_features

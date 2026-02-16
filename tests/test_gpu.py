@@ -59,13 +59,71 @@ class TestUVQ1p5GPU:
 
 @gpu_required
 @pytest.mark.gpu
-class TestUVQ1p0GPUBug:
-    def test_uvq1p0_cuda_raises(self):
-        """UVQ1p0 is not nn.Module, so .cuda() should raise AttributeError.
-
-        This documents the bug at uvq_inference.py:177.
-        """
+class TestUVQ1p0GPU:
+    @pytest.fixture(scope="class")
+    def model(self):
         from uvq_pytorch.utils.uvq1p0 import UVQ1p0
-        model = UVQ1p0()
-        with pytest.raises(AttributeError):
-            model.cuda()
+        m = UVQ1p0()
+        return m
+
+    def test_model_moves_to_cuda(self, model):
+        model.cuda()
+        # Check that each sub-network's parameters are on CUDA
+        param = next(model.contentnet.model.parameters())
+        assert param.device.type == "cuda"
+        param = next(model.compressionnet.model.parameters())
+        assert param.device.type == "cuda"
+        param = next(model.distortionnet.model.parameters())
+        assert param.device.type == "cuda"
+        for name, agg_model in model.aggregationnet.models.items():
+            param = next(agg_model.parameters())
+            assert param.device.type == "cuda", f"Aggregation model {name} not on CUDA"
+            break  # just check the first one
+        # Move back to CPU
+        model.contentnet.model.cpu()
+        model.compressionnet.model.cpu()
+        model.distortionnet.model.cpu()
+        for agg_model in model.aggregationnet.models.values():
+            agg_model.cpu()
+
+    def test_contentnet_forward_on_cuda(self, model):
+        import numpy as np
+        model.contentnet.model.cuda()
+        frame = np.random.randn(3, 496, 496).astype(np.float32)
+        features, labels = model.contentnet.predict_and_get_features(frame, device="cuda")
+        assert features.shape == (1, 16, 16, 100)
+        assert labels.shape == (3862,)
+        model.contentnet.model.cpu()
+
+    def test_compressionnet_forward_on_cuda(self, model):
+        import numpy as np
+        model.compressionnet.model.cuda()
+        patch = np.random.randn(1, 3, 5, 180, 320).astype(np.float32)
+        features, labels = model.compressionnet.predict_and_get_features(patch, device="cuda")
+        assert features.shape[0] == 1
+        model.compressionnet.model.cpu()
+
+    def test_distortionnet_forward_on_cuda(self, model):
+        import numpy as np
+        model.distortionnet.model.cuda()
+        frame = np.random.randn(1, 3, 360, 640).astype(np.float32)
+        features, labels = model.distortionnet.predict_and_get_features(frame, device="cuda")
+        assert features.shape[0] == 1
+        model.distortionnet.model.cpu()
+
+    def test_aggregationnet_forward_on_cuda(self, model):
+        import numpy as np
+        model.cuda()
+        compression_features = np.random.randn(1, 16, 16, 100).astype(np.float32)
+        content_features = np.random.randn(1, 16, 16, 100).astype(np.float32)
+        distortion_features = np.random.randn(1, 16, 16, 100).astype(np.float32)
+        results = model.aggregationnet.predict(
+            compression_features, content_features, distortion_features, device="cuda"
+        )
+        assert "compression_content_distortion" in results
+        # Move back
+        model.contentnet.model.cpu()
+        model.compressionnet.model.cpu()
+        model.distortionnet.model.cpu()
+        for agg_model in model.aggregationnet.models.values():
+            agg_model.cpu()

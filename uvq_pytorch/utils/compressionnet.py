@@ -135,30 +135,31 @@ class CompressionNetInference:
         self.model.load_state_dict(model)
         return model
 
-    def predict(self, patch):
+    def predict(self, patch, device="cpu"):
         """
         patch is a 5d numpy array of shape (batch_size, channel, depth, width, height)
         batch_size is assumed to be 1 for now. But should work with larger.
         """
         with torch.no_grad():
-            _, label_probs = self.model(torch.Tensor(patch))
-        return label_probs.detach().numpy()
+            _, label_probs = self.model(torch.from_numpy(patch).float().to(device))
+        return label_probs.detach().cpu().numpy()
 
-    def predict_and_get_features(self, patch) -> tuple[np.ndarray, np.ndarray]:
+    def predict_and_get_features(self, patch, device="cpu") -> tuple[np.ndarray, np.ndarray]:
         """
         patch is a 5d numpy array of shape (batch_size, channel, depth=5, width, height)
         batch_size is assumed to be 1 for now. But should work with larger.
         """
         with torch.no_grad():
-            features, label_probs = self.model(torch.Tensor(patch))
+            features, label_probs = self.model(torch.from_numpy(patch).float().to(device))
         return (
-            features.detach().numpy().transpose(*self.features_transpose),
-            label_probs.detach().numpy()[0],
+            features.detach().cpu().numpy().transpose(*self.features_transpose),
+            label_probs.detach().cpu().numpy()[0],
         )
 
     def get_labels_and_features_for_all_frames(
         self,
         video: np.ndarray,
+        device="cpu",
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Gets the predicted labels and features for all frames in a video.
@@ -208,7 +209,7 @@ class CompressionNetInference:
                         i * self.patch_width : (i + 1) * self.patch_width,
                     ]
 
-                    patch_feature, patch_label = self.predict_and_get_features(patch)
+                    patch_feature, patch_label = self.predict_and_get_features(patch, device=device)
                     feature[
                         k,
                         j

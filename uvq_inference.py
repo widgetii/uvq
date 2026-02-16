@@ -112,6 +112,7 @@ def run_batch_inference(args):
             video_path,
             video_length,
             transpose_flag,
+            device=args.device,
         )
         score = float(results["compression_content_distortion"])
       results_to_write.append(f"{os.path.basename(video_path)},{score}")
@@ -183,12 +184,15 @@ def run_single_inference(args):
       print(f"  {f}")
   elif args.gradcam and args.model_version == "1.0":
     uvq_inference = uvq1p0.UVQ1p0()
+    if args.device == "cuda":
+      uvq_inference.cuda()
     print("Running UVQ 1.0 Grad-CAM inference. FPS argument is ignored (uses 5fps).")
     results = uvq_inference.infer_gradcam(
         video_filename,
         video_length,
         transpose,
         output_dir=args.gradcam_output,
+        device=args.device,
     )
     results = {
         k: float(v) if isinstance(v, (int, float)) else v
@@ -235,6 +239,7 @@ def run_single_inference(args):
         video_filename,
         video_length,
         transpose,
+        device=args.device,
     )
     results = {k: float(v) for k, v in results.items() if k not in _PATCH_KEYS}
   else:

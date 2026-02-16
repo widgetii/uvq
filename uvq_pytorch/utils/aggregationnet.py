@@ -94,19 +94,22 @@ class AggregationNetInference:
         compression_features: np.ndarray,
         content_features: np.ndarray,
         distortion_features: np.ndarray,
+        device="cpu",
     ) -> dict[str, float]:
         feature_results = defaultdict(list)
         for model_name, features in self.get_model_names_iterator():
             with torch.no_grad():
                 r = self.models[model_name](
                     {
-                        "compression": torch.Tensor(
+                        "compression": torch.from_numpy(
                             compression_features.transpose(0, 3, 1, 2)
-                        ),
-                        "content": torch.Tensor(content_features.transpose(0, 3, 1, 2)),
-                        "distortion": torch.Tensor(
+                        ).float().to(device),
+                        "content": torch.from_numpy(
+                            content_features.transpose(0, 3, 1, 2)
+                        ).float().to(device),
+                        "distortion": torch.from_numpy(
                             distortion_features.transpose(0, 3, 1, 2)
-                        ),
+                        ).float().to(device),
                     }
                 )
             feature_results["_".join(features)].append(r[0].item())

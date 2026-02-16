@@ -110,6 +110,26 @@ PyTorch 2.3.0+cu121 (last version supporting sm_52).
 
 Batch size is limited by the 6 GB VRAM on the GTX 980 Ti. Larger GPUs can use batch_size=24.
 
+## UVQ 1.0 -- GPU (GTX 980 Ti)
+
+PyTorch 2.3.0+cu121. Input: 720p video, 5 fps sampling, dual-stream (720p + 496x496).
+
+| Stage | Time (s) | % |
+|-------|----------|---|
+| probe | 0.132 | 0.9% |
+| video_decode | 3.985 | 27.9% |
+| model_loading | 0.636 | 4.5% |
+| gpu_transfer | 0.066 | 0.5% |
+| contentnet_forward | 0.365 | 2.6% |
+| compressionnet_forward | 7.581 | 53.1% |
+| distortionnet_forward | 1.445 | 10.1% |
+| aggregation | 0.068 | 0.5% |
+| **TOTAL** | **14.276** | |
+
+Combined score: **3.236**
+
+GPU acceleration reduces total inference time from 64.5s to 14.3s (**4.5x speedup**). CompressionNet remains the bottleneck at 53% of GPU pipeline time, though it drops from 47.8s to 7.6s (**6.3x speedup**). ContentNet sees the largest relative speedup (**7.0x**), and DistortionNet improves **6.5x**. The aggregation ensemble (35 small models) also benefits (**1.8x**). Video decoding now accounts for 28% of total time, up from 6% on CPU.
+
 ## UVQ 1.5 -- MLX (Apple M4)
 
 MLX backend using Apple Silicon GPU acceleration. Input: 1 fps sampling, batch_size=24.
@@ -165,6 +185,13 @@ Score matches PyTorch CPU within 0.01 tolerance. The ONNX models are also used f
 | UVQ 1.5 | 32.0 | 3.034 | **1.0x** |
 | UVQ 1.0 | 63.6 | 3.236 | 2.0x slower |
 
+### UVQ 1.0 CPU vs GPU (720p)
+
+| Device | Time (s) | Score | Relative |
+|--------|----------|-------|----------|
+| CPU (i7-6700K) | 64.5 | 3.236 | 1.0x |
+| GPU (GTX 980 Ti) | 14.3 | 3.236 | **4.5x faster** |
+
 ### UVQ 1.5 CPU vs GPU vs MLX vs ONNX (720p / single frame)
 
 | Device | Time (s) | Forward Pass (s) | Relative |
@@ -186,7 +213,7 @@ The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-en
 
 3. **MLX provides moderate forward pass speedup.** The M4's GPU accelerates inference 1.5x vs x86 CPU, but FFmpeg decode on macOS is slower, keeping end-to-end times comparable.
 
-4. **UVQ 1.0 CompressionNet is expensive.** The 3D Inception network processing 16 patches per second takes 48s alone -- more than the entire UVQ 1.5 pipeline.
+4. **UVQ 1.0 CompressionNet is expensive.** The 3D Inception network processing 16 patches per second takes 48s alone on CPU -- more than the entire UVQ 1.5 pipeline. On GPU it drops to 7.6s (6.3x speedup), making the full UVQ 1.0 pipeline 4.5x faster end-to-end.
 
 5. **Model loading is fast.** UVQ 1.5 loads in ~0.1-0.2s (30 MB, PyTorch) or ~0.04s (safetensors, MLX). UVQ 1.0 in ~0.6s (169 MB). Neither is a bottleneck.
 
@@ -202,6 +229,7 @@ uv run pytest -m perf -v -s
 
 # GPU benchmarks require a CUDA-capable GPU and a compatible PyTorch build
 uv run python uvq_inference.py <video> --model_version 1.5 --device cuda
+uv run python uvq_inference.py <video> --model_version 1.0 --device cuda
 
 # MLX benchmarks (macOS Apple Silicon only)
 uv sync --group mlx

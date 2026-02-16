@@ -52,11 +52,21 @@ class UVQ1p0:
         pretrained=eval_mode
     )
 
+  def cuda(self):
+    """Moves all sub-network models to CUDA."""
+    self.contentnet.model.cuda()
+    self.compressionnet.model.cuda()
+    self.distortionnet.model.cuda()
+    for name in self.aggregationnet.models:
+      self.aggregationnet.models[name].cuda()
+    return self
+
   def infer(
       self,
       video_filename: str,
       video_length: int,
       transpose: bool = False,
+      device: str = "cpu",
   ) -> dict[str, Any]:
     """Runs UVQ 1.0 inference on a video file.
 
@@ -73,21 +83,22 @@ class UVQ1p0:
     )
     content_features, _ = (
         self.contentnet.get_labels_and_features_for_all_frames(
-            video=video_resized2
+            video=video_resized2, device=device
         )
     )
     compression_features, compression_labels = (
         self.compressionnet.get_labels_and_features_for_all_frames(
-            video=video_resized1,
+            video=video_resized1, device=device,
         )
     )
     distortion_features, distortion_labels = (
         self.distortionnet.get_labels_and_features_for_all_frames(
-            video=video_resized1,
+            video=video_resized1, device=device,
         )
     )
     results = self.aggregationnet.predict(
-        compression_features, content_features, distortion_features
+        compression_features, content_features, distortion_features,
+        device=device,
     )
     results["compression_patch_labels"] = compression_labels  # (T, 4, 4, 1)
     results["distortion_patch_labels"] = distortion_labels    # (T, 2, 2, 26)
@@ -99,6 +110,7 @@ class UVQ1p0:
       video_length: int,
       transpose: bool,
       output_dir: str,
+      device: str = "cpu",
   ) -> dict[str, float | list[str]]:
     """Runs UVQ 1.0 inference with Grad-CAM heatmap generation.
 
@@ -126,7 +138,7 @@ class UVQ1p0:
     )
 
     # Run normal inference to get quality scores
-    results = self.infer(video_filename, video_length, transpose)
+    results = self.infer(video_filename, video_length, transpose, device=device)
 
     # Re-load video for gradcam (720p, 5fps)
     video_720p, _ = self.load_video(video_filename, video_length, transpose)
@@ -159,7 +171,7 @@ class UVQ1p0:
             ]
             patch_tensor = torch.from_numpy(
                 patch_np[np.newaxis].copy()
-            ).float()
+            ).float().to(device)
 
             # Forward without no_grad to build computation graph
             features, label_probs = self.distortionnet.model(patch_tensor)

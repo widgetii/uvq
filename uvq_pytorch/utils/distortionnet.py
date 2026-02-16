@@ -286,22 +286,23 @@ class DistortionNetInference:
         self.model.load_state_dict(model)
         return model
 
-    def predict(self, frame):
+    def predict(self, frame, device="cpu"):
         with torch.no_grad():
-            _, label_probs = self.model(torch.Tensor(frame))
-        return label_probs.detach().numpy()
+            _, label_probs = self.model(torch.from_numpy(frame).float().to(device))
+        return label_probs.detach().cpu().numpy()
 
-    def predict_and_get_features(self, frame) -> tuple[np.ndarray, np.ndarray]:
+    def predict_and_get_features(self, frame, device="cpu") -> tuple[np.ndarray, np.ndarray]:
         with torch.no_grad():
-            features, label_probs = self.model(torch.Tensor(frame))
+            features, label_probs = self.model(torch.from_numpy(frame).float().to(device))
         return (
-            features.detach().numpy(),
-            label_probs.detach().numpy(),
+            features.detach().cpu().numpy(),
+            label_probs.detach().cpu().numpy(),
         )
 
     def get_labels_and_features_for_all_frames(
         self,
         video: np.ndarray,
+        device="cpu",
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Gets the predicted labels and features for all frames in a video.
@@ -346,7 +347,7 @@ class DistortionNetInference:
                         i * self.patch_width : (i + 1) * self.patch_width,
                     ]
 
-                    patch_feature, patch_label = self.predict_and_get_features(patch)
+                    patch_feature, patch_label = self.predict_and_get_features(patch, device=device)
                     feature[
                         k,
                         j
