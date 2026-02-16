@@ -47,6 +47,7 @@ class Conv2dSamePadding(nn.Module):
         stride=self.stride,
         padding=0,
         dilation=dilation,
+        groups=groups,
         bias=bias,
     )
 
@@ -227,11 +228,10 @@ class AdaptiveAvgPool2d(nn.Module):
 
 
 class BilinearResize(nn.Module):
-  """Bilinear resize for NHWC tensors using numpy-based interpolation.
+  """Bilinear resize for NHWC tensors.
 
-  Used for ContentNet's 1080x1920 → 256x256 resize.
-  Falls back to a simple bilinear implementation to ensure numerical
-  consistency across backends.
+  Uses numpy for the interpolation to ensure exact numerical consistency
+  with PyTorch's F.interpolate(mode='bilinear', align_corners=False).
   """
 
   def __init__(self, target_height, target_width):
@@ -246,50 +246,48 @@ class BilinearResize(nn.Module):
     if ih == oh and iw == ow:
       return x
 
-    # Compute sampling grid (align_corners=False)
-    h_scale = ih / oh
-    w_scale = iw / ow
+    import numpy as np
+    x_np = np.array(x)
+    result = self._resize_numpy(x_np, oh, ow)
+    return mx.array(result)
 
-    # Source coordinates for each output pixel
-    h_coords = mx.arange(oh).astype(mx.float32) * h_scale + (h_scale - 1) / 2
-    w_coords = mx.arange(ow).astype(mx.float32) * w_scale + (w_scale - 1) / 2
+  @staticmethod
+  def _resize_numpy(x_np, oh, ow):
+    """Bilinear resize matching PyTorch F.interpolate(align_corners=False)."""
+    import numpy as np
+    n, ih, iw, c = x_np.shape
 
-    h_coords = mx.clip(h_coords, 0, ih - 1)
-    w_coords = mx.clip(w_coords, 0, iw - 1)
+    # PyTorch align_corners=False coordinate mapping:
+    # src = (dst + 0.5) * (src_size / dst_size) - 0.5
+    h_coords = (np.arange(oh, dtype=np.float64) + 0.5) * (ih / oh) - 0.5
+    w_coords = (np.arange(ow, dtype=np.float64) + 0.5) * (iw / ow) - 0.5
 
-    h0 = mx.floor(h_coords).astype(mx.int32)
-    w0 = mx.floor(w_coords).astype(mx.int32)
-    h1 = mx.minimum(h0 + 1, ih - 1)
-    w1 = mx.minimum(w0 + 1, iw - 1)
+    h_coords = np.clip(h_coords, 0, ih - 1)
+    w_coords = np.clip(w_coords, 0, iw - 1)
 
-    h_frac = h_coords - h0.astype(mx.float32)
-    w_frac = w_coords - w0.astype(mx.float32)
+    h0 = np.floor(h_coords).astype(np.intp)
+    w0 = np.floor(w_coords).astype(np.intp)
+    h1 = np.minimum(h0 + 1, ih - 1)
+    w1 = np.minimum(w0 + 1, iw - 1)
 
-    # Reshape for broadcasting: h → (oh, 1), w → (1, ow)
-    h0 = h0[:, None]      # (oh, 1)
-    h1 = h1[:, None]      # (oh, 1)
-    w0 = w0[None, :]      # (1, ow)
-    w1 = w1[None, :]      # (1, ow)
-    h_frac = h_frac[:, None, None]  # (oh, 1, 1)
-    w_frac = w_frac[None, :, None]  # (1, ow, 1)
+    hf = (h_coords - h0).astype(np.float32)[:, None, None]  # (oh, 1, 1)
+    wf = (w_coords - w0).astype(np.float32)[None, :, None]  # (1, ow, 1)
 
-    # Create index grids: (oh, ow)
-    h0_grid = mx.broadcast_to(h0, (oh, ow))
-    h1_grid = mx.broadcast_to(h1, (oh, ow))
-    w0_grid = mx.broadcast_to(w0, (oh, ow))
-    w1_grid = mx.broadcast_to(w1, (oh, ow))
+    # Index grids
+    h0g = h0[:, None]  # (oh, 1)
+    h1g = h1[:, None]
+    w0g = w0[None, :]  # (1, ow)
+    w1g = w1[None, :]
 
-    # Gather and interpolate per batch element
-    # x: (N, H, W, C) — index with [h_grid, w_grid] for each batch
-    top_left = x[:, h0_grid, w0_grid, :]      # (N, oh, ow, C)
-    top_right = x[:, h0_grid, w1_grid, :]     # (N, oh, ow, C)
-    bottom_left = x[:, h1_grid, w0_grid, :]   # (N, oh, ow, C)
-    bottom_right = x[:, h1_grid, w1_grid, :]  # (N, oh, ow, C)
-
-    top = top_left * (1 - w_frac) + top_right * w_frac
-    bottom = bottom_left * (1 - w_frac) + bottom_right * w_frac
-    result = top * (1 - h_frac) + bottom * h_frac
-
+    result = np.empty((n, oh, ow, c), dtype=np.float32)
+    for i in range(n):
+      tl = x_np[i][h0g, w0g]  # (oh, ow, c)
+      tr = x_np[i][h0g, w1g]
+      bl = x_np[i][h1g, w0g]
+      br = x_np[i][h1g, w1g]
+      top = tl + (tr - tl) * wf
+      bot = bl + (br - bl) * wf
+      result[i] = top + (bot - top) * hf
     return result
 
 

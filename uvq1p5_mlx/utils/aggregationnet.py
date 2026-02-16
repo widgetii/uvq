@@ -91,6 +91,7 @@ class AggregationNet(nn.Module):
   def _load_weights(self, model_path):
     weights = mx.load(model_path)
     self.model.load_weights(list(weights.items()))
+    self.eval()
 
   def __call__(self, content_features, distortion_features):
     """Run aggregation.
