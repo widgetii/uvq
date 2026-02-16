@@ -10,26 +10,29 @@ UVQ (Universal Video Quality) is Google's no-reference perceptual video quality 
 
 ### Install dependencies
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 FFmpeg and FFprobe must also be available on PATH (or specified via `--ffmpeg_path`/`--ffprobe_path`).
 
 ### Run inference
 ```bash
 # UVQ 1.5 (recommended)
-python uvq_inference.py <video_file> --model_version 1.5
+uv run python uvq_inference.py <video_file> --model_version 1.5
 
 # UVQ 1.0 (legacy)
-python uvq_inference.py <video_file> --model_version 1.0
+uv run python uvq_inference.py <video_file> --model_version 1.0
 
 # GPU acceleration
-python uvq_inference.py <video_file> --model_version 1.5 --device cuda
+uv run python uvq_inference.py <video_file> --model_version 1.5 --device cuda
 
 # Batch mode (pass a .txt file listing video paths)
-python uvq_inference.py video_list.txt --model_version 1.5 --output batch_results.txt
+uv run python uvq_inference.py video_list.txt --model_version 1.5 --output batch_results.txt
 ```
 
-There are no tests, linters, or build steps configured in this repository.
+### Run tests
+```bash
+uv run pytest tests/ -v --timeout=120 -k "not gpu and not perf"
+```
 
 ## Architecture
 

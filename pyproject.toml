@@ -1,0 +1,32 @@
+[project]
+name = "uvq"
+version = "0.1.0"
+description = "Universal Video Quality – no-reference perceptual video quality assessment"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "tqdm==4.67.1",
+    "numpy==2.1.2",
+    "pandas==2.2.3",
+    "gradio>=4.0",
+    "matplotlib>=3.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-timeout",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
