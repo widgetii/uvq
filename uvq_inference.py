@@ -35,7 +35,10 @@ def run_batch_inference(args):
     print("Error: --output must be specified when input is a .txt file list.")
     return
 
-  if args.model_version == "1.5":
+  if args.model_version == "1.5" and args.device == "mlx":
+    from uvq1p5_mlx.utils.uvq1p5 import UVQ1p5 as UVQ1p5MLX
+    model = UVQ1p5MLX()
+  elif args.model_version == "1.5":
     model = uvq1p5.UVQ1p5()
   elif args.model_version == "1.0":
     model = uvq1p0.UVQ1p0()
@@ -157,7 +160,18 @@ def run_single_inference(args):
     print(f"Skipping {video_filename} due to 0 length.")
     return
 
-  if args.model_version == "1.5":
+  if args.model_version == "1.5" and args.device == "mlx":
+    from uvq1p5_mlx.utils.uvq1p5 import UVQ1p5 as UVQ1p5MLX
+    uvq_inference = UVQ1p5MLX()
+    results = uvq_inference.infer(
+        video_filename,
+        video_length,
+        transpose,
+        fps=fps,
+        orig_fps=orig_fps,
+        ffmpeg_path=args.ffmpeg_path,
+    )
+  elif args.model_version == "1.5":
     uvq_inference = uvq1p5.UVQ1p5()
     if args.device == "cuda":
       uvq_inference.cuda()
@@ -209,6 +223,20 @@ def main():
   if args.device == "cuda" and not torch.cuda.is_available():
     print("Error: CUDA is not available, please use --device cpu")
     return
+
+  if args.device == "mlx":
+    import sys
+    if sys.platform != "darwin":
+      print("Error: --device mlx is only supported on macOS (Apple Silicon)")
+      return
+    try:
+      import mlx.core  # noqa: F401
+    except ImportError:
+      print("Error: mlx is not installed. Install with: uv sync --group mlx")
+      return
+    if args.model_version != "1.5":
+      print("Error: --device mlx only supports --model_version 1.5")
+      return
 
   if args.input.endswith(".txt"):
     run_batch_inference(args)
@@ -266,8 +294,8 @@ def setup_parser():
       "--device",
       type=str,
       default="cpu",
-      choices=["cpu", "cuda"],
-      help="Device to run inference on (e.g., 'cpu' or 'cuda').",
+      choices=["cpu", "cuda", "mlx"],
+      help="Device to run inference on ('cpu', 'cuda', or 'mlx').",
   )
   parser.add_argument(
       "--fps",

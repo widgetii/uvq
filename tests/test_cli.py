@@ -31,6 +31,11 @@ class TestSetupParser:
         args = parser.parse_args(["video.mp4", "--device", "cuda"])
         assert args.device == "cuda"
 
+    def test_mlx_device(self):
+        parser = setup_parser()
+        args = parser.parse_args(["video.mp4", "--device", "mlx"])
+        assert args.device == "mlx"
+
     def test_transpose_flag(self):
         parser = setup_parser()
         args = parser.parse_args(["video.mp4", "--transpose"])

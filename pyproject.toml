@@ -17,6 +17,11 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-timeout",
+    "safetensors>=0.7.0",
+]
+mlx = [
+    "mlx>=0.30.0",
+    "safetensors>=0.7.0",
 ]
 
 [tool.uv]

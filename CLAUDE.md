@@ -25,6 +25,10 @@ uv run python uvq_inference.py <video_file> --model_version 1.0
 # GPU acceleration
 uv run python uvq_inference.py <video_file> --model_version 1.5 --device cuda
 
+# MLX (Apple Silicon) acceleration
+uv sync --group mlx
+uv run python uvq_inference.py <video_file> --model_version 1.5 --device mlx
+
 # Batch mode (pass a .txt file listing video paths)
 uv run python uvq_inference.py video_list.txt --model_version 1.5 --output batch_results.txt
 ```
@@ -49,7 +53,7 @@ Video → probe.py (FFprobe metadata) → video_reader.py (FFmpeg decode + resiz
 
 ### Two Model Versions
 
-**UVQ 1.5** (`uvq1p5_pytorch/`) — Default, lighter model (~30MB checkpoints). Uses two EfficientNet-B0 branches (content + distortion) fused by an aggregation net. Input: 1080p, configurable fps (default 1). Output: single `uvq1p5_score`.
+**UVQ 1.5** (`uvq1p5_pytorch/`) — Default, lighter model (~30MB checkpoints). Uses two EfficientNet-B0 branches (content + distortion) fused by an aggregation net. Input: 1080p, configurable fps (default 1). Output: single `uvq1p5_score`. Also available as an MLX backend (`uvq1p5_mlx/`) for Apple Silicon acceleration via `--device mlx`.
 
 **UVQ 1.0** (`uvq_pytorch/`) — Legacy, larger model (~169MB checkpoints). Uses three separate networks (compression via 3D Inception, content via EfficientNet, distortion) with a multi-combination aggregation net. Input: 720p + 496x496 downsampled, 5 fps. Output: multiple scores (compression, content, distortion, and combinations).
 

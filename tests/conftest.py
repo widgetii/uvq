@@ -35,6 +35,7 @@ def device_cuda():
 
 UVQ1P5_CHECKPOINT_DIR = os.path.join(REPO_ROOT, "uvq1p5_pytorch", "checkpoints")
 UVQ1P0_CHECKPOINT_DIR = os.path.join(REPO_ROOT, "uvq_pytorch", "checkpoint")
+UVQ1P5_MLX_CHECKPOINT_DIR = os.path.join(REPO_ROOT, "uvq1p5_mlx", "checkpoints")
 
 
 @pytest.fixture
@@ -45,6 +46,11 @@ def uvq1p5_checkpoint_dir():
 @pytest.fixture
 def uvq1p0_checkpoint_dir():
     return UVQ1P0_CHECKPOINT_DIR
+
+
+@pytest.fixture
+def uvq1p5_mlx_checkpoint_dir():
+    return UVQ1P5_MLX_CHECKPOINT_DIR
 
 
 # ---------------------------------------------------------------------------
