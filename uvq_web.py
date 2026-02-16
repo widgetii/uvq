@@ -434,7 +434,7 @@ def build_app():
             with gr.TabItem("Upload Video"):
                 upload_input = gr.Video(label="Upload a video file")
                 upload_gradcam = gr.Checkbox(
-                    label="Generate Grad-CAM heatmaps", value=False,
+                    label="Generate Grad-CAM heatmaps", value=True,
                 )
                 upload_btn = gr.Button("Analyze", variant="primary")
 
@@ -444,7 +444,7 @@ def build_app():
                     label="Select a demo video",
                 )
                 demo_gradcam = gr.Checkbox(
-                    label="Generate Grad-CAM heatmaps", value=False,
+                    label="Generate Grad-CAM heatmaps", value=True,
                 )
                 demo_btn = gr.Button("Load & Analyze", variant="primary")
 
