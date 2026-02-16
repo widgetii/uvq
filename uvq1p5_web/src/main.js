@@ -106,23 +106,24 @@ async function processVideo(uvq, file) {
   const canvas = new OffscreenCanvas(videoEl.videoWidth, videoEl.videoHeight);
   const ctx = canvas.getContext("2d");
 
-  const scores = [];
+  const frames = [];
   const t0 = performance.now();
 
   for (let t = 0; t < duration; t++) {
-    // Seek to middle of each second for more representative frame
+    // Decode: seek + capture + preprocess
+    const decodeStart = performance.now();
     videoEl.currentTime = t + 0.5;
     await new Promise((resolve) => { videoEl.onseeked = resolve; });
-
-    // Capture frame
     ctx.drawImage(videoEl, 0, 0);
-
-    // Preprocess
     const { content, patches } = preprocessFrame(canvas);
+    const decodeTime = performance.now() - decodeStart;
 
     // Infer
+    const inferStart = performance.now();
     const score = await uvq.infer(content, patches);
-    scores.push(score);
+    const inferTime = performance.now() - inferStart;
+
+    frames.push({ score, decodeTime, inferTime });
 
     // Update progress
     progressBar.value = ((t + 1) / duration) * 100;
@@ -133,12 +134,12 @@ async function processVideo(uvq, file) {
   URL.revokeObjectURL(url);
 
   // Display results
-  const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+  const avgScore = frames.reduce((a, f) => a + f.score, 0) / frames.length;
   scoreEl.textContent = avgScore.toFixed(3);
   timingEl.textContent = `${duration} frames in ${(elapsed / 1000).toFixed(1)}s (${(elapsed / duration).toFixed(0)} ms/frame)`;
 
-  frameScoresEl.innerHTML = scores
-    .map((s, i) => `<tr><td>${i}</td><td>${s.toFixed(4)}</td></tr>`)
+  frameScoresEl.innerHTML = frames
+    .map((f, i) => `<tr><td>${i}</td><td>${f.score.toFixed(4)}</td><td>${f.decodeTime.toFixed(0)} ms</td><td>${f.inferTime.toFixed(0)} ms</td></tr>`)
     .join("");
 
   resultsEl.style.display = "block";
