@@ -38,7 +38,7 @@ from uvq_pytorch.utils import uvq1p0
 matplotlib.use("Agg")
 
 # Keys returned by UVQ 1.0 that are not scalar scores
-_NON_SCORE_KEYS = {"gradcam_files", "compression_patch_labels", "distortion_patch_labels"}
+_NON_SCORE_KEYS = {"gradcam_files", "content_labels", "compression_patch_labels", "distortion_patch_labels"}
 
 # 26-class distortion labels used by UVQ 1.0's distortion network.
 # Known names from the UVQ blog post are placed at likely positions;
@@ -74,6 +74,78 @@ _DISTORTION_CLASS_NAMES = [
     "High sharpen",
     "Contrast change",
 ]
+
+def make_diagnostic_report(contentnet, content_labels, compression_patch_labels,
+                           distortion_patch_labels, scores):
+    """Build a Markdown diagnostic report summarizing UVQ 1.0 network outputs.
+
+    Args:
+        contentnet: ContentNetInference instance (for label_probabilities_to_text).
+        content_labels: (T, 3862) content class probabilities per frame.
+        compression_patch_labels: (T, 4, 4, 1) compression level per patch.
+        distortion_patch_labels: (T, 2, 2, 26) distortion probabilities per patch.
+        scores: dict of the 7 UVQ 1.0 quality scores.
+
+    Returns:
+        Markdown string with ContentNet, DistortionNet, CompressionNet, and
+        score summaries.
+    """
+    lines = []
+
+    # --- ContentNet ---
+    avg_content = np.mean(content_labels, axis=0)  # (3862,)
+    names, probs, _ = contentnet.label_probabilities_to_text(avg_content, top_n=5)
+    content_items = [f"{n} ({p:.3f})" for n, p in zip(names, probs)]
+    lines.append("### ContentNet (CT)")
+    lines.append(", ".join(content_items))
+    lines.append("")
+
+    # --- DistortionNet ---
+    # Average across time and patches → (26,)
+    avg_dist = np.mean(distortion_patch_labels, axis=(0, 1, 2))
+    sorted_idx = np.argsort(avg_dist)[::-1]
+    dist_items = []
+    for idx in sorted_idx:
+        if len(dist_items) >= 5:
+            break
+        if idx == 0:
+            continue  # skip "Non-distortion"
+        dist_items.append(
+            f"{_DISTORTION_CLASS_NAMES[idx]} ({avg_dist[idx]:.3f})"
+        )
+    lines.append("### DistortionNet (DT)")
+    lines.append(", ".join(dist_items))
+    lines.append("")
+
+    # --- CompressionNet ---
+    mean_comp = float(np.mean(compression_patch_labels))
+    if mean_comp < 0.2:
+        comp_desc = "low"
+    elif mean_comp < 0.4:
+        comp_desc = "medium-low"
+    elif mean_comp < 0.6:
+        comp_desc = "medium"
+    elif mean_comp < 0.8:
+        comp_desc = "medium-high"
+    else:
+        comp_desc = "high"
+    lines.append("### CompressionNet (CP)")
+    lines.append(f"Mean compression level: {mean_comp:.3f} ({comp_desc})")
+    lines.append("")
+
+    # --- Quality scores ---
+    ct = scores.get("content", 0)
+    dt = scores.get("distortion", 0)
+    cp = scores.get("compression", 0)
+    combined = scores.get("compression_content_distortion", 0)
+    lines.append("### Predicted Quality Scores")
+    lines.append(
+        f"(CT, DT, CP) = ({ct:.3f}, {dt:.3f}, {cp:.3f}), "
+        f"(CT+DT+CP) = {combined:.3f}"
+    )
+
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Demo videos from YouTube-UGC dataset
@@ -213,7 +285,8 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
             k: float(v) for k, v in results_1p0.items() if k not in _NON_SCORE_KEYS
         }
 
-    # Extract per-patch labels (always present from UVQ 1.0)
+    # Extract per-patch and content labels (always present from UVQ 1.0)
+    content_labels = results_1p0.get("content_labels")
     compression_patch_labels = results_1p0.get("compression_patch_labels")
     distortion_patch_labels = results_1p0.get("distortion_patch_labels")
 
@@ -236,6 +309,12 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
     compression_plot = make_compression_patch_plot(compression_patch_labels)
     distortion_plot = make_distortion_patch_plot(distortion_patch_labels)
 
+    diagnostic_md = make_diagnostic_report(
+        model_1p0.contentnet, content_labels,
+        compression_patch_labels, distortion_patch_labels,
+        results_1p0_scores,
+    )
+
     full_json = json.dumps(
         {"uvq1p5": results_1p5, "uvq1p0": results_1p0_scores},
         indent=2,
@@ -248,6 +327,7 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
         meta_md,          # metadata markdown
         f"{score_1p5:.3f}",   # UVQ 1.5 score
         f"{score_1p0_combined:.3f}",  # UVQ 1.0 combined score
+        diagnostic_md,    # UVQ 1.0 diagnostic report
         temporal_plot,    # temporal chart
         dimensions_plot,  # dimensions bar chart
         full_json,        # raw JSON
@@ -470,6 +550,9 @@ def build_app():
             "content, compression, and distortion assessments."
         )
 
+        with gr.Accordion("UVQ 1.0 Diagnostic Report", open=True):
+            diagnostic_report = gr.Markdown(label="Diagnostic Report")
+
         temporal_chart = gr.Plot(label="Temporal Quality (UVQ 1.5)")
         dimensions_chart = gr.Plot(label="Quality Dimensions (UVQ 1.0)")
 
@@ -504,6 +587,7 @@ def build_app():
             meta_display,
             score_1p5_display,
             score_1p0_display,
+            diagnostic_report,
             temporal_chart,
             dimensions_chart,
             json_output,

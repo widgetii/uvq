@@ -81,7 +81,7 @@ class UVQ1p0:
     video_resized1, video_resized2 = self.load_video(
         video_filename, video_length, transpose
     )
-    content_features, _ = (
+    content_features, content_labels = (
         self.contentnet.get_labels_and_features_for_all_frames(
             video=video_resized2, device=device
         )
@@ -100,6 +100,7 @@ class UVQ1p0:
         compression_features, content_features, distortion_features,
         device=device,
     )
+    results["content_labels"] = content_labels                 # (T, 3862)
     results["compression_patch_labels"] = compression_labels  # (T, 4, 4, 1)
     results["distortion_patch_labels"] = distortion_labels    # (T, 2, 2, 26)
     return results

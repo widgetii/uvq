@@ -30,7 +30,7 @@ from utils import probe
 from uvq1p5_pytorch.utils import uvq1p5
 from uvq_pytorch.utils import uvq1p0
 
-_PATCH_KEYS = {"compression_patch_labels", "distortion_patch_labels"}
+_PATCH_KEYS = {"content_labels", "compression_patch_labels", "distortion_patch_labels"}
 
 
 def run_batch_inference(args):
