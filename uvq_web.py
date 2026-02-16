@@ -100,8 +100,10 @@ model_1p5 = uvq1p5.UVQ1p5()
 if device == "cuda":
     model_1p5.cuda()
 
-print("Loading UVQ 1.0 model on CPU...")
+print(f"Loading UVQ 1.0 model on {device}...")
 model_1p0 = uvq1p0.UVQ1p0()
+if device == "cuda":
+    model_1p0.cuda()
 
 # ---------------------------------------------------------------------------
 # Demo video download helper
@@ -194,6 +196,7 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
         progress(0.55, desc="Running UVQ 1.0 inference with Grad-CAM...")
         results_1p0 = model_1p0.infer_gradcam(
             video_path, video_length, transpose, output_dir=gradcam_dir_1p0,
+            device=device,
         )
         gradcam_1p0 = results_1p0.get("gradcam_files", [])
         # Ensure numeric values for score display (gradcam results may include lists/arrays)
@@ -202,7 +205,7 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
         }
     else:
         progress(0.55, desc="Running UVQ 1.0 inference...")
-        results_1p0 = model_1p0.infer(video_path, video_length, transpose)
+        results_1p0 = model_1p0.infer(video_path, video_length, transpose, device=device)
         results_1p0_scores = {
             k: float(v) for k, v in results_1p0.items() if k not in _NON_SCORE_KEYS
         }
