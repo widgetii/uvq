@@ -23,10 +23,14 @@ from typing import Any
 import tqdm
 import torch
 
+import numpy as np
+
 from utils import probe
 
 from uvq1p5_pytorch.utils import uvq1p5
 from uvq_pytorch.utils import uvq1p0
+
+_PATCH_KEYS = {"compression_patch_labels", "distortion_patch_labels"}
 
 
 def run_batch_inference(args):
@@ -189,6 +193,7 @@ def run_single_inference(args):
     results = {
         k: float(v) if isinstance(v, (int, float)) else v
         for k, v in results.items()
+        if k not in _PATCH_KEYS
     }
     print(f"Grad-CAM: saved {len(results['gradcam_files'])} frames to {args.gradcam_output}")
     for f in results["gradcam_files"]:
@@ -231,7 +236,7 @@ def run_single_inference(args):
         video_length,
         transpose,
     )
-    results = {k: float(v) for k, v in results.items()}
+    results = {k: float(v) for k, v in results.items() if k not in _PATCH_KEYS}
   else:
     print(f"Unknown model version: {args.model_version}")
     return

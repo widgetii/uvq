@@ -28,6 +28,7 @@ import urllib.request
 import gradio as gr
 import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 from utils import probe
@@ -35,6 +36,41 @@ from uvq1p5_pytorch.utils import uvq1p5
 from uvq_pytorch.utils import uvq1p0
 
 matplotlib.use("Agg")
+
+# Keys returned by UVQ 1.0 that are not scalar scores
+_NON_SCORE_KEYS = {"gradcam_files", "compression_patch_labels", "distortion_patch_labels"}
+
+# 26-class distortion labels used by UVQ 1.0's distortion network.
+# Known names from the UVQ blog post are placed at likely positions;
+# the rest are placeholders that can be updated if the full mapping is published.
+_DISTORTION_CLASS_NAMES = [
+    "Jitter",
+    "Color quantization",
+    "Lens blur",
+    "Denoise",
+    "Gaussian blur",
+    "White noise",
+    "Class 6",
+    "Class 7",
+    "Class 8",
+    "Class 9",
+    "Class 10",
+    "Class 11",
+    "Class 12",
+    "Class 13",
+    "Class 14",
+    "Class 15",
+    "Class 16",
+    "Class 17",
+    "Class 18",
+    "Class 19",
+    "Class 20",
+    "Class 21",
+    "Class 22",
+    "Class 23",
+    "Class 24",
+    "Class 25",
+]
 
 # ---------------------------------------------------------------------------
 # Demo videos from YouTube-UGC dataset
@@ -160,14 +196,20 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
             video_path, video_length, transpose, output_dir=gradcam_dir_1p0,
         )
         gradcam_1p0 = results_1p0.get("gradcam_files", [])
-        # Ensure numeric values for score display (gradcam results may include lists)
+        # Ensure numeric values for score display (gradcam results may include lists/arrays)
         results_1p0_scores = {
-            k: float(v) for k, v in results_1p0.items() if k != "gradcam_files"
+            k: float(v) for k, v in results_1p0.items() if k not in _NON_SCORE_KEYS
         }
     else:
         progress(0.55, desc="Running UVQ 1.0 inference...")
         results_1p0 = model_1p0.infer(video_path, video_length, transpose)
-        results_1p0_scores = {k: float(v) for k, v in results_1p0.items()}
+        results_1p0_scores = {
+            k: float(v) for k, v in results_1p0.items() if k not in _NON_SCORE_KEYS
+        }
+
+    # Extract per-patch labels (always present from UVQ 1.0)
+    compression_patch_labels = results_1p0.get("compression_patch_labels")
+    distortion_patch_labels = results_1p0.get("distortion_patch_labels")
 
     progress(0.90, desc="Generating visualizations...")
 
@@ -185,6 +227,8 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
 
     temporal_plot = make_temporal_plot(results_1p5, sample_fps)
     dimensions_plot = make_dimensions_plot(results_1p0_scores)
+    compression_plot = make_compression_patch_plot(compression_patch_labels)
+    distortion_plot = make_distortion_patch_plot(distortion_patch_labels)
 
     full_json = json.dumps(
         {"uvq1p5": results_1p5, "uvq1p0": results_1p0_scores},
@@ -203,12 +247,96 @@ def run_inference(video_path, enable_gradcam=False, progress=gr.Progress()):
         full_json,        # raw JSON
         gradcam_1p5,      # Grad-CAM gallery for UVQ 1.5
         gradcam_1p0,      # Grad-CAM gallery for UVQ 1.0
+        compression_plot, # compression patch heatmap
+        distortion_plot,  # distortion patch heatmap + bar chart
     )
 
 
 # ---------------------------------------------------------------------------
 # Visualization helpers
 # ---------------------------------------------------------------------------
+
+def make_compression_patch_plot(compression_labels):
+    """Heatmap of per-patch compression severity (4x4 grid, time-averaged)."""
+    if compression_labels is None:
+        return None
+    # compression_labels shape: (T, 4, 4, 1)
+    avg = np.mean(compression_labels, axis=0)[:, :, 0]  # (4, 4)
+
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(avg, cmap="RdYlGn_r", vmin=0, vmax=1, aspect="equal")
+    for i in range(4):
+        for j in range(4):
+            ax.text(j, i, f"{avg[i, j]:.2f}", ha="center", va="center",
+                    fontsize=10, color="black", fontweight="bold")
+    ax.set_xticks(range(4))
+    ax.set_yticks(range(4))
+    ax.set_xticklabels(["Left", "", "", "Right"])
+    ax.set_yticklabels(["Top", "", "", "Bottom"])
+    ax.set_title(
+        "Compression Artifacts — 4\u00d74 Spatial Grid (time-averaged)\n"
+        "0.0 = no compression artifacts, 1.0 = severe compression",
+        fontsize=10,
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Compression Level")
+    fig.tight_layout()
+    return fig
+
+
+def make_distortion_patch_plot(distortion_labels):
+    """Two-panel figure: 2x2 mean-distortion heatmap + top-10 class bar chart."""
+    if distortion_labels is None:
+        return None
+    # distortion_labels shape: (T, 2, 2, 26)
+    avg = np.mean(distortion_labels, axis=0)  # (2, 2, 26)
+
+    # Left panel: mean distortion probability per patch
+    mean_per_patch = np.mean(avg, axis=2)  # (2, 2)
+
+    # Right panel: top-10 distortion classes (averaged over all patches and time)
+    class_means = np.mean(avg, axis=(0, 1))  # (26,)
+    top_indices = np.argsort(class_means)[::-1][:10]
+    top_names = [_DISTORTION_CLASS_NAMES[i] for i in top_indices]
+    top_values = class_means[top_indices]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5),
+                                   gridspec_kw={"width_ratios": [1, 1.8]})
+
+    # Left: 2x2 heatmap
+    im = ax1.imshow(mean_per_patch, cmap="RdYlGn_r", vmin=0, vmax=1, aspect="equal")
+    for i in range(2):
+        for j in range(2):
+            ax1.text(j, i, f"{mean_per_patch[i, j]:.3f}", ha="center", va="center",
+                     fontsize=11, color="black", fontweight="bold")
+    ax1.set_xticks([0, 1])
+    ax1.set_yticks([0, 1])
+    ax1.set_xticklabels(["Left", "Right"])
+    ax1.set_yticklabels(["Top", "Bottom"])
+    ax1.set_title("Mean Distortion per Region", fontsize=10)
+    fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+
+    # Right: horizontal bar chart
+    y_pos = np.arange(len(top_names))
+    ax2.barh(y_pos, top_values, color="#f59e0b", height=0.6)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(top_names)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Mean Probability")
+    ax2.set_title("Top-10 Most Active Distortion Classes", fontsize=10)
+    ax2.set_xlim(0, max(top_values.max() * 1.2, 0.1))
+    for i, v in enumerate(top_values):
+        ax2.text(v + 0.005, i, f"{v:.3f}", va="center", fontsize=9)
+    ax2.grid(True, axis="x", alpha=0.3)
+
+    fig.suptitle(
+        "Distortion Detection — 2\u00d72 Spatial Grid (time-averaged)\n"
+        "Probability of visual artifacts per region. Higher = more distortion detected.",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    return fig
+
 
 def make_temporal_plot(results_1p5, fps):
     """Line plot of per-frame UVQ 1.5 scores over time."""
@@ -330,8 +458,29 @@ def build_app():
             score_1p5_display = gr.Textbox(label="UVQ 1.5 Score", interactive=False)
             score_1p0_display = gr.Textbox(label="UVQ 1.0 Combined Score", interactive=False)
 
+        gr.Markdown(
+            "Scores range from **1** (lowest, e.g. severely blurry) to **5** "
+            "(highest, e.g. professionally produced). The combined score fuses "
+            "content, compression, and distortion assessments."
+        )
+
         temporal_chart = gr.Plot(label="Temporal Quality (UVQ 1.5)")
         dimensions_chart = gr.Plot(label="Quality Dimensions (UVQ 1.0)")
+
+        with gr.Accordion("Per-Patch Spatial Quality (UVQ 1.0)", open=True):
+            gr.Markdown(
+                "UVQ 1.0 divides each frame into a spatial grid and assesses "
+                "each tile independently, allowing localization of quality issues. "
+                "The compression network uses a **4\u00d74 grid** and the distortion "
+                "network uses a **2\u00d72 grid**. Values shown are time-averaged "
+                "across all frames."
+            )
+            compression_patch_chart = gr.Plot(
+                label="Compression Artifacts (4\u00d74 grid)",
+            )
+            distortion_patch_chart = gr.Plot(
+                label="Distortion Analysis (2\u00d72 grid)",
+            )
 
         with gr.Accordion("Grad-CAM Heatmaps", open=True):
             gradcam_gallery_1p5 = gr.Gallery(
@@ -354,6 +503,8 @@ def build_app():
             json_output,
             gradcam_gallery_1p5,
             gradcam_gallery_1p0,
+            compression_patch_chart,
+            distortion_patch_chart,
         ]
 
         upload_btn.click(

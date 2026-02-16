@@ -17,6 +17,7 @@ limitations under the License.
 
 import os
 import sys
+from typing import Any
 
 import numpy as np
 import torch
@@ -56,7 +57,7 @@ class UVQ1p0:
       video_filename: str,
       video_length: int,
       transpose: bool = False,
-  ) -> dict[str, float]:
+  ) -> dict[str, Any]:
     """Runs UVQ 1.0 inference on a video file.
 
     Args:
@@ -65,7 +66,7 @@ class UVQ1p0:
         transpose: Whether to transpose the video before processing.
 
     Returns:
-        A dictionary containing the UVQ 1.0 scores.
+        A dictionary containing the UVQ 1.0 scores and per-patch labels.
     """
     video_resized1, video_resized2 = self.load_video(
         video_filename, video_length, transpose
@@ -75,12 +76,12 @@ class UVQ1p0:
             video=video_resized2
         )
     )
-    compression_features, _ = (
+    compression_features, compression_labels = (
         self.compressionnet.get_labels_and_features_for_all_frames(
             video=video_resized1,
         )
     )
-    distortion_features, _ = (
+    distortion_features, distortion_labels = (
         self.distortionnet.get_labels_and_features_for_all_frames(
             video=video_resized1,
         )
@@ -88,6 +89,8 @@ class UVQ1p0:
     results = self.aggregationnet.predict(
         compression_features, content_features, distortion_features
     )
+    results["compression_patch_labels"] = compression_labels  # (T, 4, 4, 1)
+    results["distortion_patch_labels"] = distortion_labels    # (T, 2, 2, 26)
     return results
 
   def infer_gradcam(
