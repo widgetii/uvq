@@ -28,31 +28,37 @@ function setStatus(msg) { statusEl.textContent = msg; }
 function showError(msg) { errorEl.textContent = msg; errorEl.style.display = "block"; }
 
 async function init() {
-  // Check WebGPU
-  const hasWebGPU = !!(navigator.gpu);
-  const backend = hasWebGPU ? "webgpu" : "wasm";
+  const uvq = new UVQ(ort);
+  const modelPaths = [
+    "models/content_net.onnx",
+    "models/distortion_net.onnx",
+    "models/aggregation_net.onnx",
+  ];
 
-  if (!hasWebGPU) {
-    setStatus("WebGPU not available, falling back to WASM (slower).");
+  // WebGPU requires a secure context (HTTPS or localhost)
+  let backend = "wasm";
+  if (window.isSecureContext && navigator.gpu) {
+    backend = "webgpu";
+  } else if (!window.isSecureContext) {
+    console.warn("WebGPU unavailable: page is not in a secure context (use HTTPS or localhost).");
+  } else {
+    console.warn("WebGPU unavailable: navigator.gpu not found in this browser.");
   }
 
-  // Configure ort
-  const sessionOptions = { executionProviders: [backend] };
-
   setStatus(`Loading models (${backend} backend)...`);
-  const uvq = new UVQ(ort);
-
   try {
-    await uvq.load(
-      "models/content_net.onnx",
-      "models/distortion_net.onnx",
-      "models/aggregation_net.onnx",
-      sessionOptions,
-    );
+    await uvq.load(...modelPaths, { executionProviders: [backend] });
   } catch (e) {
-    showError(`Failed to load models: ${e.message}`);
-    setStatus("Model loading failed.");
-    return;
+    if (backend === "webgpu") {
+      console.warn("WebGPU session failed, falling back to WASM:", e);
+      backend = "wasm";
+      setStatus("Loading models (wasm fallback)...");
+      await uvq.load(...modelPaths, { executionProviders: ["wasm"] });
+    } else {
+      showError(`Failed to load models: ${e.message}`);
+      setStatus("Model loading failed.");
+      return;
+    }
   }
 
   setStatus("Warming up...");
@@ -63,7 +69,7 @@ async function init() {
     console.warn("Warmup failed:", e);
   }
 
-  setStatus("Ready. Select a video file to assess.");
+  setStatus(`Ready (${backend}). Select a video file to assess.`);
   fileArea.style.display = "block";
 
   fileInput.addEventListener("change", async () => {
