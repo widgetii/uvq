@@ -1,0 +1,19 @@
+{
+  "name": "uvq1p5-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "UVQ 1.5 video quality assessment in the browser via ONNX Runtime WebGPU",
+  "dependencies": {
+    "onnxruntime-web": "^1.21.0"
+  },
+  "devDependencies": {
+    "onnxruntime-node": "^1.21.0",
+    "vite": "^6.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "node test/perf-test.mjs"
+  }
+}

@@ -45,6 +45,41 @@ jobs:
       - name: Run MLX tests
         run: uv run pytest tests/test_mlx.py tests/test_mlx_cross_backend.py -v --timeout=300 -k "not perf"
 
+  test-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies (with ONNX)
+        run: uv sync --group onnx
+
+      - name: Export ONNX models
+        run: uv run python scripts/export_onnx.py
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install npm dependencies
+        working-directory: uvq1p5_web
+        run: npm install
+
+      - name: Run Node.js tests
+        working-directory: uvq1p5_web
+        run: npm test
+
+      - name: Run ONNX cross-backend test
+        run: uv run pytest tests/test_onnx_cross_backend.py -v --timeout=300
+
   # Template for GPU testing on self-hosted runners.
   # Enable by removing the `if: false` line and configuring a runner with CUDA.
   test-gpu:

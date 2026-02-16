@@ -23,6 +23,10 @@ mlx = [
     "mlx>=0.30.0",
     "safetensors>=0.7.0",
 ]
+onnx = [
+    "onnx>=1.17.0",
+    "onnxruntime>=1.21.0",
+]
 
 [tool.uv]
 default-groups = ["dev"]

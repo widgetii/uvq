@@ -142,6 +142,20 @@ Score: **3.923**
 
 Model loading is near-instant (~0.04s) thanks to the safetensors format. Video decode is slower than x86 because FFmpeg runs on the efficiency cores. Scores match the PyTorch CPU backend within 0.01 tolerance.
 
+## UVQ 1.5 -- ONNX Runtime (Node.js CPU)
+
+ONNX Runtime with CPU execution provider (native bindings via `onnxruntime-node`). Models exported from PyTorch via `scripts/export_onnx.py`. Input: synthetic random tensors, single-frame inference.
+
+| Stage | Time (ms) |
+|-------|-----------|
+| model_loading | 866 |
+| content_net | 27.8 (median) |
+| distortion_net | 697.1 (median) |
+| aggregation_net | 0.2 (median) |
+| **total_pipeline** | **726.2 (median)** |
+
+Score matches PyTorch CPU within 0.01 tolerance. The ONNX models are also used for browser-based WebGPU inference via `onnxruntime-web`.
+
 ## Comparison
 
 ### UVQ 1.5 vs UVQ 1.0 (CPU, 720p)
@@ -151,13 +165,16 @@ Model loading is near-instant (~0.04s) thanks to the safetensors format. Video d
 | UVQ 1.5 | 32.0 | 3.034 | **1.0x** |
 | UVQ 1.0 | 63.6 | 3.236 | 2.0x slower |
 
-### UVQ 1.5 CPU vs GPU vs MLX (720p)
+### UVQ 1.5 CPU vs GPU vs MLX vs ONNX (720p / single frame)
 
 | Device | Time (s) | Forward Pass (s) | Relative |
 |--------|----------|-------------------|----------|
 | CPU (i7-6700K) | 32.3 | 28.4 | 1.0x |
 | MLX (Apple M4) | 31.5 | 19.3 | 1.0x (1.5x forward) |
 | GPU (GTX 980 Ti) | 5.6 | 1.6 | **5.8x faster** |
+| ONNX Node.js CPU (i7-6700K) | — | 0.73/frame | 0.5x per-frame* |
+
+\*ONNX single-frame forward pass (0.73s) is faster per-frame than PyTorch CPU (1.42s/frame = 28.4s / 20 frames) due to ONNX Runtime's graph optimizations. End-to-end comparison is not directly applicable since the Node.js test uses synthetic input without video decode.
 
 The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-end time is similar due to slower FFmpeg decode on macOS. The forward pass alone is **18.2x faster** on the discrete GPU. End-to-end GPU speedup is lower (5.8x) because video decoding (FFmpeg) now dominates at 64% of total GPU pipeline time.
 
@@ -175,6 +192,8 @@ The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-en
 
 6. **VRAM limits batch size.** The GTX 980 Ti (6 GB) can only fit batch_size=4 for 720p and batch_size=1 for 1080p. Modern GPUs with 8+ GB should handle batch_size=24. MLX uses unified memory so batch_size=24 works on 16 GB M4.
 
+7. **ONNX Runtime is faster per-frame than PyTorch CPU.** Graph-level optimizations in ONNX Runtime reduce single-frame inference to ~0.73s vs ~1.42s per frame in PyTorch. The same ONNX models power the browser WebGPU backend.
+
 ## Reproducing
 
 ```bash
@@ -187,4 +206,9 @@ uv run python uvq_inference.py <video> --model_version 1.5 --device cuda
 # MLX benchmarks (macOS Apple Silicon only)
 uv sync --group mlx
 uv run pytest -m "perf and mlx" -v -s
+
+# ONNX Node.js benchmarks
+uv sync --group onnx
+uv run python scripts/export_onnx.py
+cd uvq1p5_web && npm install && npm test
 ```

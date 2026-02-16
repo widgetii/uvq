@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 .venv-gpu/
+
+# Web package
+uvq1p5_web/node_modules/
+uvq1p5_web/dist/
+uvq1p5_web/public/models/*.onnx
+uvq1p5_web/public/models/reference.json
+uvq1p5_web/package-lock.json
