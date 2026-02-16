@@ -19,7 +19,8 @@
     table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
     th, td { padding: 0.4rem 0.8rem; text-align: left; border-bottom: 1px solid #eee; }
     th { background: #f5f5f5; font-weight: 600; }
-    td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    td { text-align: right; font-variant-numeric: tabular-nums; }
+    td:first-child { text-align: left; }
     #progress-bar-container { display: none; margin-bottom: 1rem; }
     #progress-bar { width: 100%; height: 8px; border-radius: 4px; }
     video { display: none; }
@@ -45,7 +46,7 @@
     <div class="timing" id="timing"></div>
     <h3>Per-frame scores</h3>
     <table>
-      <thead><tr><th>Second</th><th>Score</th><th>Decode time</th><th>Inference time</th></tr></thead>
+      <thead id="frame-scores-head"><tr><th>Second</th><th>Score</th><th>Decode time</th><th>Inference time</th></tr></thead>
       <tbody id="frame-scores"></tbody>
     </table>
   </div>
