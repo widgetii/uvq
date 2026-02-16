@@ -160,7 +160,40 @@ def run_single_inference(args):
     print(f"Skipping {video_filename} due to 0 length.")
     return
 
-  if args.model_version == "1.5" and args.device == "mlx":
+  if args.gradcam and args.model_version == "1.5":
+    uvq_inference = uvq1p5.UVQ1p5()
+    if args.device == "cuda":
+      uvq_inference.cuda()
+    results = uvq_inference.infer_gradcam(
+        video_filename,
+        video_length,
+        transpose,
+        output_dir=args.gradcam_output,
+        fps=fps,
+        orig_fps=orig_fps,
+        ffmpeg_path=args.ffmpeg_path,
+        device=args.device,
+    )
+    print(f"Grad-CAM: saved {len(results['gradcam_files'])} frames to {args.gradcam_output}")
+    for f in results["gradcam_files"]:
+      print(f"  {f}")
+  elif args.gradcam and args.model_version == "1.0":
+    uvq_inference = uvq1p0.UVQ1p0()
+    print("Running UVQ 1.0 Grad-CAM inference. FPS argument is ignored (uses 5fps).")
+    results = uvq_inference.infer_gradcam(
+        video_filename,
+        video_length,
+        transpose,
+        output_dir=args.gradcam_output,
+    )
+    results = {
+        k: float(v) if isinstance(v, (int, float)) else v
+        for k, v in results.items()
+    }
+    print(f"Grad-CAM: saved {len(results['gradcam_files'])} frames to {args.gradcam_output}")
+    for f in results["gradcam_files"]:
+      print(f"  {f}")
+  elif args.model_version == "1.5" and args.device == "mlx":
     from uvq1p5_mlx.utils.uvq1p5 import UVQ1p5 as UVQ1p5MLX
     uvq_inference = UVQ1p5MLX()
     results = uvq_inference.infer(
@@ -237,6 +270,14 @@ def main():
     if args.model_version != "1.5":
       print("Error: --device mlx only supports --model_version 1.5")
       return
+
+  if args.gradcam and args.device == "mlx":
+    print("Error: --gradcam is not supported with --device mlx (no gradient support)")
+    return
+
+  if args.gradcam and args.input.endswith(".txt"):
+    print("Error: --gradcam is not supported with batch .txt input")
+    return
 
   if args.input.endswith(".txt"):
     run_batch_inference(args)
@@ -320,6 +361,17 @@ def setup_parser():
       type=str,
       default="ffprobe",
       help="Path to ffprobe executable.",
+  )
+  parser.add_argument(
+      "--gradcam",
+      action="store_true",
+      help="Enable Grad-CAM heatmap generation for the distortion branch.",
+  )
+  parser.add_argument(
+      "--gradcam_output",
+      type=str,
+      default="gradcam_output",
+      help="Output directory for Grad-CAM PNG files.",
   )
   return parser
 

@@ -84,6 +84,7 @@ class TestMainDispatch:
         mock_args = MagicMock()
         mock_args.input = "videos.txt"
         mock_args.device = "cpu"
+        mock_args.gradcam = False
         mock_parser.return_value.parse_args.return_value = mock_args
         main()
         mock_batch.assert_called_once_with(mock_args)

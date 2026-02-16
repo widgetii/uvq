@@ -18,6 +18,9 @@ limitations under the License.
 import os
 import sys
 
+import numpy as np
+import torch
+
 from . import aggregationnet
 from . import compressionnet
 from . import contentnet
@@ -85,6 +88,107 @@ class UVQ1p0:
     results = self.aggregationnet.predict(
         compression_features, content_features, distortion_features
     )
+    return results
+
+  def infer_gradcam(
+      self,
+      video_filename: str,
+      video_length: int,
+      transpose: bool,
+      output_dir: str,
+  ) -> dict[str, float | list[str]]:
+    """Runs UVQ 1.0 inference with Grad-CAM heatmap generation.
+
+    Since the UVQ 1.0 pipeline breaks the gradient graph between feature
+    extraction and aggregation, Grad-CAM backprops from the distortion
+    classifier's output (sum of 26-class sigmoid probabilities) instead
+    of the final quality score.
+
+    Args:
+        video_filename: Path to the video file.
+        video_length: Length of the video in seconds.
+        transpose: Whether to transpose the video before processing.
+        output_dir: Directory to save Grad-CAM PNG overlays.
+
+    Returns:
+        A dictionary containing UVQ 1.0 scores and a list of saved
+        Grad-CAM PNG file paths.
+    """
+    from gradcam import (
+        GradCAMHookManager,
+        compute_gradcam,
+        overlay_cam_on_frame,
+        save_gradcam_frame,
+        stitch_patch_cams,
+    )
+
+    # Run normal inference to get quality scores
+    results = self.infer(video_filename, video_length, transpose)
+
+    # Re-load video for gradcam (720p, 5fps)
+    video_720p, _ = self.load_video(video_filename, video_length, transpose)
+    # video_720p shape: (num_seconds, fps, C=3, H=720, W=1280)
+
+    num_patches_y = self.distortionnet.num_patches_y  # 2
+    num_patches_x = self.distortionnet.num_patches_x  # 2
+    patch_h = self.distortionnet.patch_height  # 360
+    patch_w = self.distortionnet.patch_width   # 640
+
+    # Hook the last conv layer of the distortion model
+    target_layer = self.distortionnet.model.features[17]
+    hook_mgr = GradCAMHookManager(target_layer)
+
+    gradcam_files = []
+    try:
+      for k in range(video_720p.shape[0]):
+        hook_mgr.reset()
+
+        # Collect per-patch CAMs for this frame
+        patch_cams = []
+        for j in range(num_patches_y):
+          for i in range(num_patches_x):
+            hook_mgr.reset()
+
+            patch_np = video_720p[
+                k, 0, :,
+                j * patch_h : (j + 1) * patch_h,
+                i * patch_w : (i + 1) * patch_w,
+            ]
+            patch_tensor = torch.from_numpy(
+                patch_np[np.newaxis].copy()
+            ).float()
+
+            # Forward without no_grad to build computation graph
+            features, label_probs = self.distortionnet.model(patch_tensor)
+
+            # Backward from sum of distortion class probabilities
+            label_probs.sum().backward()
+
+            cam = compute_gradcam(
+                hook_mgr.activations, hook_mgr.gradients
+            )  # (1, H_cam, W_cam)
+            patch_cams.append(cam[0].cpu().numpy())
+
+            self.distortionnet.model.zero_grad(set_to_none=True)
+
+        # Stitch 2x2 patch CAMs into full 720p heatmap
+        full_cam = stitch_patch_cams(
+            patch_cams, num_patches_y, num_patches_x, patch_h, patch_w,
+        )
+
+        # Recover original frame pixels: [-1, 1] → [0, 255]
+        frame_pixels = video_720p[k, 0]  # (C, H, W) numpy
+        frame_rgb = (
+            (frame_pixels.transpose(1, 2, 0) + 1) * 127.5
+        ).clip(0, 255).astype(np.uint8)
+
+        overlay = overlay_cam_on_frame(frame_rgb, full_cam)
+        filepath = save_gradcam_frame(overlay, output_dir, k, "1.0")
+        gradcam_files.append(filepath)
+    finally:
+      hook_mgr.remove()
+
+    results["gradcam_files"] = gradcam_files
     return results
 
   def load_video(self, video_filename, video_length, transpose=False):

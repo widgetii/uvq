@@ -23,6 +23,7 @@ import os
 import sys
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
@@ -166,6 +167,121 @@ class UVQ1p5(nn.Module):
         "uvq1p5_score": video_score,
         "per_frame_scores": frame_scores,
         "frame_indices": frame_indices,
+    }
+
+  def infer_gradcam(
+      self,
+      video_filename: str,
+      video_length: int,
+      transpose: bool,
+      output_dir: str,
+      fps: int = 1,
+      orig_fps: float | None = None,
+      ffmpeg_path: str = "ffmpeg",
+      device: str = "cpu",
+  ) -> dict[str, Any]:
+    """Runs UVQ 1.5 inference with Grad-CAM heatmap generation.
+
+    Produces per-frame heatmaps showing which spatial regions of the
+    distortion branch most influence the quality prediction.
+
+    Args:
+      video_filename: Path to the video file.
+      video_length: Length of the video in seconds.
+      transpose: Whether to transpose the video.
+      output_dir: Directory to save Grad-CAM PNG overlays.
+      fps: Frames per second to sample for inference.
+      orig_fps: Original frames per second of the video.
+      ffmpeg_path: Path to ffmpeg executable.
+      device: Device to run inference on (e.g., 'cpu' or 'cuda').
+
+    Returns:
+      A dictionary containing UVQ 1.5 scores and a list of saved
+      Grad-CAM PNG file paths.
+    """
+    from gradcam import (
+        GradCAMHookManager,
+        compute_gradcam,
+        overlay_cam_on_frame,
+        save_gradcam_frame,
+        stitch_patch_cams,
+    )
+
+    video_1080p, _ = self.load_video(
+        video_filename,
+        video_length,
+        transpose,
+        fps=fps,
+        ffmpeg_path=ffmpeg_path,
+    )
+    num_seconds, read_fps, c, h, w = video_1080p.shape
+    num_frames = num_seconds * read_fps
+    video_1080p = video_1080p.reshape(num_frames, 1, c, h, w)
+
+    # Hook the last conv layer of the distortion branch
+    target_layer = self.distortion_net.model.features[17]
+    hook_mgr = GradCAMHookManager(target_layer)
+
+    num_patches_y = self.distortion_net.num_patches_y  # 3
+    num_patches_x = self.distortion_net.num_patches_x  # 3
+    patch_h = self.distortion_net.patch_height  # 360
+    patch_w = self.distortion_net.patch_width   # 640
+
+    frame_scores = []
+    gradcam_files = []
+
+    try:
+      for i in range(num_frames):
+        hook_mgr.reset()
+        frame = video_1080p[i : i + 1].to(device)
+
+        # Forward without inference_mode to build computation graph
+        quality_pred = self.uvq1p5_core(frame)
+        score = quality_pred.mean()
+        frame_scores.append(score.item())
+
+        # Backward to get gradients at the hook target
+        score.backward()
+
+        activations = hook_mgr.activations  # (9, 128, H_cam, W_cam)
+        gradients = hook_mgr.gradients      # (9, 128, H_cam, W_cam)
+        cam = compute_gradcam(activations, gradients)  # (9, H_cam, W_cam)
+
+        # Stitch 3x3 patch CAMs into full-frame heatmap
+        patch_cams = [cam[j].cpu().numpy() for j in range(cam.shape[0])]
+        full_cam = stitch_patch_cams(
+            patch_cams, num_patches_y, num_patches_x, patch_h, patch_w,
+        )
+
+        # Recover original frame pixels: [-1, 1] → [0, 255]
+        frame_pixels = frame.squeeze(0).squeeze(0)  # (C, H, W)
+        frame_rgb = (
+            (frame_pixels.cpu().numpy().transpose(1, 2, 0) + 1) * 127.5
+        ).clip(0, 255).astype(np.uint8)
+
+        overlay = overlay_cam_on_frame(frame_rgb, full_cam)
+        filepath = save_gradcam_frame(overlay, output_dir, i, "1.5")
+        gradcam_files.append(filepath)
+
+        # Zero out any accumulated gradients for next frame
+        self.uvq1p5_core.zero_grad(set_to_none=True)
+    finally:
+      hook_mgr.remove()
+
+    video_score = sum(frame_scores) / len(frame_scores) if frame_scores else 0.0
+
+    if orig_fps:
+      frame_indices = [
+          int(round(j * orig_fps / fps)) for j in range(len(frame_scores))
+      ]
+    else:
+      frame_indices = list(range(len(frame_scores)))
+
+    return {
+        "uvq1p5_score": video_score,
+        "per_frame_scores": frame_scores,
+        "frame_indices": frame_indices,
+        "gradcam_files": gradcam_files,
     }
 
   def load_video(
