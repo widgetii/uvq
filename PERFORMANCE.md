@@ -4,6 +4,8 @@ Benchmark numbers for UVQ inference pipelines on a single workstation.
 
 ## Hardware
 
+### x86 Workstation
+
 | Component | Spec |
 |-----------|------|
 | CPU | Intel Core i7-6700K @ 4.00 GHz (4 cores / 8 threads) |
@@ -11,6 +13,15 @@ Benchmark numbers for UVQ inference pipelines on a single workstation.
 | GPU | NVIDIA GeForce GTX 980 Ti (6 GB VRAM, sm_52) |
 | Storage | NVMe SSD |
 | OS | Arch Linux 6.12, Python 3.12 |
+
+### Apple Silicon
+
+| Component | Spec |
+|-----------|------|
+| SoC | Apple M4 (10-core CPU / 10-core GPU) |
+| RAM | 16 GB unified memory |
+| Storage | NVMe SSD |
+| OS | macOS 26.3, Python 3.12 |
 
 ## Test Video
 
@@ -99,6 +110,38 @@ PyTorch 2.3.0+cu121 (last version supporting sm_52).
 
 Batch size is limited by the 6 GB VRAM on the GTX 980 Ti. Larger GPUs can use batch_size=24.
 
+## UVQ 1.5 -- MLX (Apple M4)
+
+MLX backend using Apple Silicon GPU acceleration. Input: 1 fps sampling, batch_size=24.
+
+### 720p input
+
+| Stage | Time (s) | % |
+|-------|----------|---|
+| probe | 0.630 | 2.0% |
+| video_decode | 11.564 | 36.7% |
+| model_loading | 0.040 | 0.1% |
+| forward_pass | 19.272 | 61.1% |
+| scoring | 0.034 | 0.1% |
+| **TOTAL** | **31.540** | |
+
+Score: **3.034**
+
+### 1080p native input
+
+| Stage | Time (s) | % |
+|-------|----------|---|
+| probe | 0.490 | 1.8% |
+| video_decode | 11.767 | 43.1% |
+| model_loading | 0.073 | 0.3% |
+| forward_pass | 14.947 | 54.8% |
+| scoring | 0.019 | 0.1% |
+| **TOTAL** | **27.295** | |
+
+Score: **3.923**
+
+Model loading is near-instant (~0.04s) thanks to the safetensors format. Video decode is slower than x86 because FFmpeg runs on the efficiency cores. Scores match the PyTorch CPU backend within 0.01 tolerance.
+
 ## Comparison
 
 ### UVQ 1.5 vs UVQ 1.0 (CPU, 720p)
@@ -108,14 +151,15 @@ Batch size is limited by the 6 GB VRAM on the GTX 980 Ti. Larger GPUs can use ba
 | UVQ 1.5 | 32.0 | 3.034 | **1.0x** |
 | UVQ 1.0 | 63.6 | 3.236 | 2.0x slower |
 
-### UVQ 1.5 CPU vs GPU (720p)
+### UVQ 1.5 CPU vs GPU vs MLX (720p)
 
 | Device | Time (s) | Forward Pass (s) | Relative |
 |--------|----------|-------------------|----------|
 | CPU (i7-6700K) | 32.3 | 28.4 | 1.0x |
+| MLX (Apple M4) | 31.5 | 19.3 | 1.0x (1.5x forward) |
 | GPU (GTX 980 Ti) | 5.6 | 1.6 | **5.8x faster** |
 
-The forward pass alone is **18.2x faster** on GPU. End-to-end speedup is lower (5.8x) because video decoding (FFmpeg) now dominates at 64% of total GPU pipeline time.
+The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-end time is similar due to slower FFmpeg decode on macOS. The forward pass alone is **18.2x faster** on the discrete GPU. End-to-end GPU speedup is lower (5.8x) because video decoding (FFmpeg) now dominates at 64% of total GPU pipeline time.
 
 ## Key Observations
 
@@ -123,11 +167,13 @@ The forward pass alone is **18.2x faster** on GPU. End-to-end speedup is lower (
 
 2. **GPU bottleneck shifts to video decoding.** With GPU inference at 1.6s vs CPU at 28.4s, FFmpeg decode becomes the dominant stage (64% of GPU pipeline time).
 
-3. **UVQ 1.0 CompressionNet is expensive.** The 3D Inception network processing 16 patches per second takes 48s alone -- more than the entire UVQ 1.5 pipeline.
+3. **MLX provides moderate forward pass speedup.** The M4's GPU accelerates inference 1.5x vs x86 CPU, but FFmpeg decode on macOS is slower, keeping end-to-end times comparable.
 
-4. **Model loading is fast.** UVQ 1.5 loads in ~0.1-0.2s (30 MB), UVQ 1.0 in ~0.6s (169 MB). Neither is a bottleneck.
+4. **UVQ 1.0 CompressionNet is expensive.** The 3D Inception network processing 16 patches per second takes 48s alone -- more than the entire UVQ 1.5 pipeline.
 
-5. **VRAM limits batch size.** The GTX 980 Ti (6 GB) can only fit batch_size=4 for 720p and batch_size=1 for 1080p. Modern GPUs with 8+ GB should handle batch_size=24.
+5. **Model loading is fast.** UVQ 1.5 loads in ~0.1-0.2s (30 MB, PyTorch) or ~0.04s (safetensors, MLX). UVQ 1.0 in ~0.6s (169 MB). Neither is a bottleneck.
+
+6. **VRAM limits batch size.** The GTX 980 Ti (6 GB) can only fit batch_size=4 for 720p and batch_size=1 for 1080p. Modern GPUs with 8+ GB should handle batch_size=24. MLX uses unified memory so batch_size=24 works on 16 GB M4.
 
 ## Reproducing
 
@@ -137,4 +183,8 @@ uv run pytest -m perf -v -s
 
 # GPU benchmarks require a CUDA-capable GPU and a compatible PyTorch build
 uv run python uvq_inference.py <video> --model_version 1.5 --device cuda
+
+# MLX benchmarks (macOS Apple Silicon only)
+uv sync --group mlx
+uv run pytest -m "perf and mlx" -v -s
 ```
