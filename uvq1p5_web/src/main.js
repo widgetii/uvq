@@ -17,7 +17,6 @@ const statusEl = $("#status");
 const errorEl = $("#error-banner");
 const fileArea = $("#file-input-area");
 const fileInput = $("#video-file");
-const decodeMethodEl = $("#decode-method");
 const progressContainer = $("#progress-bar-container");
 const progressBar = $("#progress-bar");
 const resultsEl = $("#results");
@@ -71,14 +70,6 @@ async function initDecoders(file) {
 async function init() {
   const backends = {}; // { name: UVQ instance }
 
-  // Disable WebCodecs option if not supported
-  const hasWebCodecs = typeof VideoDecoder !== "undefined";
-  if (!hasWebCodecs) {
-    const wcOption = decodeMethodEl.querySelector('option[value="webcodecs"]');
-    wcOption.disabled = true;
-    wcOption.textContent += " (not supported)";
-  }
-
   // WebGPU requires a secure context (HTTPS or localhost)
   const hasWebGPU = window.isSecureContext && !!navigator.gpu;
   if (!hasWebGPU) {
@@ -126,17 +117,15 @@ async function init() {
     if (!file) return;
     clearError();
 
-    const method = decodeMethodEl.value;
-
     if (compareMode) {
-      await processVideoCompare(backends.webgpu, backends.wasm, file, method);
+      await processVideoCompare(backends.webgpu, backends.wasm, file);
     } else {
-      await processVideoSingle(backends[names[0]], names[0], file, method);
+      await processVideoSingle(backends[names[0]], names[0], file);
     }
   });
 }
 
-async function processVideoCompare(uvqGpu, uvqWasm, file, method) {
+async function processVideoCompare(uvqGpu, uvqWasm, file) {
   resultsEl.style.display = "none";
   progressContainer.style.display = "block";
   progressBar.value = 0;
@@ -173,16 +162,14 @@ async function processVideoCompare(uvqGpu, uvqWasm, file, method) {
     const vidTime = performance.now() - vidStart;
 
     // Decode with WebCodecs (timing only if available)
-    let wcTime = null, wcCanvas = null;
+    let wcTime = null;
     if (wcDecoder) {
       const wcStart = performance.now();
-      wcCanvas = await wcDecoder.decodeFrame(t);
+      await wcDecoder.decodeFrame(t);
       wcTime = performance.now() - wcStart;
     }
 
-    // Preprocess from the selected decoder's canvas
-    const canvas = (method === "webcodecs" && wcCanvas) ? wcCanvas : vidCanvas;
-    const { content, patches } = preprocessFrame(canvas);
+    const { content, patches } = preprocessFrame(vidCanvas);
 
     // Infer WebGPU
     const gpuStart = performance.now();
@@ -249,7 +236,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file, method) {
   setStatus("Done.");
 }
 
-async function processVideoSingle(uvq, backendName, file, method) {
+async function processVideoSingle(uvq, backendName, file) {
   resultsEl.style.display = "none";
   progressContainer.style.display = "block";
   progressBar.value = 0;
@@ -286,17 +273,15 @@ async function processVideoSingle(uvq, backendName, file, method) {
     const vidTime = performance.now() - vidStart;
 
     // Decode with WebCodecs (timing only if available)
-    let wcTime = null, wcCanvas = null;
+    let wcTime = null;
     if (wcDecoder) {
       const wcStart = performance.now();
-      wcCanvas = await wcDecoder.decodeFrame(t);
+      await wcDecoder.decodeFrame(t);
       wcTime = performance.now() - wcStart;
     }
 
-    // Preprocess from the selected decoder's canvas
-    const canvas = (method === "webcodecs" && wcCanvas) ? wcCanvas : vidCanvas;
     const inferStart = performance.now();
-    const { content, patches } = preprocessFrame(canvas);
+    const { content, patches } = preprocessFrame(vidCanvas);
     const score = await uvq.infer(content, patches);
     const inferTime = performance.now() - inferStart;
 
