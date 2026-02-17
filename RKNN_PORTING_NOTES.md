@@ -477,6 +477,101 @@ Same as Board 2: the factory image ships with librknnrt.so **1.4.0**
 (September 2022), which rejects RKNN model format version 6. Must be
 updated before any RKNN models can be loaded.
 
+## Running inference on the board
+
+### Prerequisites
+
+1. **NPU driver** — requires the vendor BSP kernel (not mainline). Verify:
+
+```bash
+ls /dev/rknpu* 2>/dev/null || ls /dev/dri/renderD129  # either node works
+cat /sys/kernel/debug/rknpu/version                     # e.g. 0.9.6
+```
+
+2. **Install Python dependencies:**
+
+```bash
+# rknn-toolkit-lite2 (aarch64 wheel from Rockchip GitHub — not on PyPI)
+pip install rknn_toolkit_lite2-2.3.2-cp310-cp310-manylinux_2_17_aarch64.whl
+
+# C runtime (must match toolkit version)
+sudo cp librknnrt.so /usr/lib/ && sudo ldconfig
+
+# ONNX Runtime (for aggregation net CPU fallback)
+pip install onnxruntime
+
+# OpenCV (for frame resize in the preprocessing pipeline)
+pip install opencv-python
+
+# FFmpeg (for video decoding)
+sudo apt install ffmpeg
+```
+
+3. **Model files** — three files are needed:
+
+| File | Source | Location on board |
+|---|---|---|
+| `content_net.rknn` | `scripts/export_rknn.py` (on PC) | `uvq1p5_rknn/models/` |
+| `distortion_net.rknn` | `scripts/export_rknn.py` (on PC) | `uvq1p5_rknn/models/` |
+| `aggregation_net.onnx` | `scripts/export_onnx.py` (on PC) | `uvq1p5_web/public/models/` |
+
+Generate and copy:
+
+```bash
+# On PC (x86_64):
+uv run python scripts/export_onnx.py                    # → ONNX models
+python scripts/export_rknn.py                            # → RKNN models (use rknn-toolkit2 venv)
+
+# Copy to board:
+scp uvq1p5_rknn/models/content_net.rknn \
+    uvq1p5_rknn/models/distortion_net.rknn \
+    user@orangepi:~/uvq/uvq1p5_rknn/models/
+scp uvq1p5_web/public/models/aggregation_net.onnx \
+    user@orangepi:~/uvq/uvq1p5_web/public/models/
+```
+
+### CLI usage
+
+Single video:
+
+```bash
+python uvq_inference.py video.mp4 --model_version 1.5 --device rknn
+```
+
+With full JSON output:
+
+```bash
+python uvq_inference.py video.mp4 --model_version 1.5 --device rknn --output_all_stats
+```
+
+Save results to file:
+
+```bash
+python uvq_inference.py video.mp4 --model_version 1.5 --device rknn --output result.json
+```
+
+Batch mode (text file with one video path per line):
+
+```bash
+python uvq_inference.py video_list.txt --model_version 1.5 --device rknn --output results.txt
+```
+
+Custom FPS sampling (default is 1 fps):
+
+```bash
+python uvq_inference.py video.mp4 --model_version 1.5 --device rknn --fps 2
+```
+
+### Limitations
+
+- **No Grad-CAM** — RKNN is forward-only; `--gradcam` is rejected with `--device rknn`
+- **UVQ 1.5 only** — `--model_version 1.0` is not supported with `--device rknn`
+- **Hybrid pipeline** — content/distortion nets run on NPU (FP16), aggregation
+  net runs on CPU via ONNX Runtime (see "Aggregation net produces wrong results
+  on NPU" above for the root cause)
+- **~1 fps throughput** on 1080p at 1 fps sampling (922 ms/frame median),
+  bottlenecked by 9 sequential distortion patch inferences through EfficientNet-B0
+
 ## Testing without PyTorch on the device
 
 The standard cross-backend test pattern (load both models, feed same input,
