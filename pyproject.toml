@@ -27,6 +27,9 @@ onnx = [
     "onnx>=1.17.0",
     "onnxruntime>=1.21.0",
 ]
+rknn = [
+    "opencv-python>=4.8.0",
+]
 
 [tool.uv]
 default-groups = ["dev"]

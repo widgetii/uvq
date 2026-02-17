@@ -36,6 +36,11 @@ class TestSetupParser:
         args = parser.parse_args(["video.mp4", "--device", "mlx"])
         assert args.device == "mlx"
 
+    def test_rknn_device(self):
+        parser = setup_parser()
+        args = parser.parse_args(["video.mp4", "--device", "rknn"])
+        assert args.device == "rknn"
+
     def test_transpose_flag(self):
         parser = setup_parser()
         args = parser.parse_args(["video.mp4", "--transpose"])

@@ -4,7 +4,12 @@ import os
 import sys
 
 import pytest
-import torch
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 # Insert repo root into sys.path so that model modules (which use
 # sys.path.append hacks to import video_reader) resolve correctly.
@@ -14,16 +19,20 @@ if REPO_ROOT not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Device fixtures
+# Device fixtures (require PyTorch)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def device_cpu():
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not installed")
     return torch.device("cpu")
 
 
 @pytest.fixture
 def device_cuda():
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not installed")
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     return torch.device("cuda")
@@ -60,6 +69,8 @@ def uvq1p5_mlx_checkpoint_dir():
 @pytest.fixture
 def synthetic_1080p_tensor():
     """Single-frame 1080p video tensor: (N, 1, 3, 1080, 1920)."""
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not installed")
     torch.manual_seed(42)
     return torch.randn(1, 1, 3, 1080, 1920)
 
@@ -68,5 +79,7 @@ def synthetic_1080p_tensor():
 def synthetic_small_tensor():
     """Small tensor for quick forward-pass smoke tests: (N, 1, 3, 1080, 1920)
     with N=2 to test batching."""
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not installed")
     torch.manual_seed(42)
     return torch.randn(2, 1, 3, 1080, 1920)

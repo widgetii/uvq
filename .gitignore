@@ -9,3 +9,7 @@ uvq1p5_web/dist/
 uvq1p5_web/public/models/*.onnx
 uvq1p5_web/public/models/reference.json
 uvq1p5_web/package-lock.json
+
+# RKNN models
+uvq1p5_rknn/models/*.rknn
+uvq1p5_rknn/models/reference.json

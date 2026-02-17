@@ -42,6 +42,9 @@ def run_batch_inference(args):
   if args.model_version == "1.5" and args.device == "mlx":
     from uvq1p5_mlx.utils.uvq1p5 import UVQ1p5 as UVQ1p5MLX
     model = UVQ1p5MLX()
+  elif args.model_version == "1.5" and args.device == "rknn":
+    from uvq1p5_rknn.utils.uvq1p5 import UVQ1p5 as UVQ1p5RKNN
+    model = UVQ1p5RKNN()
   elif args.model_version == "1.5":
     model = uvq1p5.UVQ1p5()
   elif args.model_version == "1.0":
@@ -118,6 +121,9 @@ def run_batch_inference(args):
       results_to_write.append(f"{os.path.basename(video_path)},{score}")
     except Exception as e:
       print(f"Error processing {video_path}: {e}")
+
+  if args.device == "rknn" and hasattr(model, "release"):
+    model.release()
 
   # Write results
   try:
@@ -213,6 +219,18 @@ def run_single_inference(args):
         orig_fps=orig_fps,
         ffmpeg_path=args.ffmpeg_path,
     )
+  elif args.model_version == "1.5" and args.device == "rknn":
+    from uvq1p5_rknn.utils.uvq1p5 import UVQ1p5 as UVQ1p5RKNN
+    uvq_inference = UVQ1p5RKNN()
+    results = uvq_inference.infer(
+        video_filename,
+        video_length,
+        transpose,
+        fps=fps,
+        orig_fps=orig_fps,
+        ffmpeg_path=args.ffmpeg_path,
+    )
+    uvq_inference.release()
   elif args.model_version == "1.5":
     uvq_inference = uvq1p5.UVQ1p5()
     if args.device == "cuda":
@@ -281,8 +299,19 @@ def main():
       print("Error: --device mlx only supports --model_version 1.5")
       return
 
-  if args.gradcam and args.device == "mlx":
-    print("Error: --gradcam is not supported with --device mlx (no gradient support)")
+  if args.device == "rknn":
+    try:
+      from rknnlite.api import RKNNLite  # noqa: F401
+    except ImportError:
+      print("Error: rknn-toolkit-lite2 is not installed.")
+      print("Install from: https://github.com/airockchip/rknn-toolkit2")
+      return
+    if args.model_version != "1.5":
+      print("Error: --device rknn only supports --model_version 1.5")
+      return
+
+  if args.gradcam and args.device in ("mlx", "rknn"):
+    print(f"Error: --gradcam is not supported with --device {args.device} (no gradient support)")
     return
 
   if args.gradcam and args.input.endswith(".txt"):
@@ -345,8 +374,8 @@ def setup_parser():
       "--device",
       type=str,
       default="cpu",
-      choices=["cpu", "cuda", "mlx"],
-      help="Device to run inference on ('cpu', 'cuda', or 'mlx').",
+      choices=["cpu", "cuda", "mlx", "rknn"],
+      help="Device to run inference on ('cpu', 'cuda', 'mlx', or 'rknn').",
   )
   parser.add_argument(
       "--fps",
