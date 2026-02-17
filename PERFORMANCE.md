@@ -176,6 +176,24 @@ ONNX Runtime with CPU execution provider (native bindings via `onnxruntime-node`
 
 Score matches PyTorch CPU within 0.01 tolerance. The ONNX models are also used for browser-based WebGPU inference via `onnxruntime-web`.
 
+## UVQ 1.5 -- Browser WebGPU / WASM (Apple M4)
+
+ONNX Runtime Web 1.21.x in Chrome. Same ONNX models as the Node.js test. Input: 720p video, 1 fps sampling (20 frames). Video decoded via `<video>` element seeking + canvas `drawImage`.
+
+| Metric | WebGPU | WASM |
+|--------|--------|------|
+| Total inference (20 frames) | 6.2 s | 11.6 s |
+| Per-frame average | 310 ms | 580 ms |
+| Per-frame steady state (frame 3+) | 278 ms | 572 ms |
+
+Score: **3.093** (WebGPU and WASM agree within ±0.0001)
+
+WebGPU is **2.1x faster** than WASM at steady state. The first frame includes WGSL shader compilation (680 ms vs steady-state 278 ms) because warmup is skipped due to onnxruntime-web buffer lifecycle constraints. By frame 3 the pipelines are fully compiled and performance stabilizes.
+
+Video decode via WebCodecs batch decoding takes 0.19 s for all 20 frames. The `<video>` element path is ~1 ms/frame due to the browser's internal frame cache.
+
+Score differs from PyTorch/MLX (3.034) by ~0.06, likely due to differences in video decode and resize between the `<video>` element and FFmpeg.
+
 ## Comparison
 
 ### UVQ 1.5 vs UVQ 1.0 (CPU, 720p)
@@ -192,18 +210,27 @@ Score matches PyTorch CPU within 0.01 tolerance. The ONNX models are also used f
 | CPU (i7-6700K) | 64.5 | 3.236 | 1.0x |
 | GPU (GTX 980 Ti) | 14.3 | 3.236 | **4.5x faster** |
 
-### UVQ 1.5 CPU vs GPU vs MLX vs ONNX (720p / single frame)
+### UVQ 1.5 -- x86 workstation (i7-6700K + GTX 980 Ti, 720p)
 
-| Device | Time (s) | Forward Pass (s) | Relative |
-|--------|----------|-------------------|----------|
-| CPU (i7-6700K) | 32.3 | 28.4 | 1.0x |
-| MLX (Apple M4) | 31.5 | 19.3 | 1.0x (1.5x forward) |
-| GPU (GTX 980 Ti) | 5.6 | 1.6 | **5.8x faster** |
-| ONNX Node.js CPU (i7-6700K) | — | 0.73/frame | 0.5x per-frame* |
+| Backend | Forward Pass | Per-frame | Relative |
+|---------|-------------|-----------|----------|
+| PyTorch CPU | 28.4 s | 1,420 ms | 1.0x |
+| ONNX Node.js CPU | — | 726 ms | **2.0x faster**\* |
+| PyTorch GPU (GTX 980 Ti) | 1.6 s | 78 ms | **18.2x faster** |
 
-\*ONNX single-frame forward pass (0.73s) is faster per-frame than PyTorch CPU (1.42s/frame = 28.4s / 20 frames) due to ONNX Runtime's graph optimizations. End-to-end comparison is not directly applicable since the Node.js test uses synthetic input without video decode.
+\*ONNX single-frame inference (0.73s) vs PyTorch CPU (1.42s/frame). End-to-end comparison is not directly applicable since the Node.js test uses synthetic input without video decode.
 
-The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-end time is similar due to slower FFmpeg decode on macOS. The forward pass alone is **18.2x faster** on the discrete GPU. End-to-end GPU speedup is lower (5.8x) because video decoding (FFmpeg) now dominates at 64% of total GPU pipeline time.
+End-to-end GPU speedup is 5.8x (32.3s → 5.6s) rather than 18.2x because video decoding (FFmpeg) dominates at 64% of GPU pipeline time.
+
+### UVQ 1.5 -- Apple Silicon (M4, 720p)
+
+| Backend | Forward Pass | Per-frame | Relative |
+|---------|-------------|-----------|----------|
+| MLX (M4 GPU) | 19.3 s | 965 ms | 1.0x |
+| Browser WASM (M4 CPU) | 11.6 s | 580 ms | **1.7x faster** |
+| Browser WebGPU (M4 GPU) | 6.2 s | 310 ms | **3.1x faster** |
+
+MLX and WebGPU both use the M4 GPU but through different frameworks: MLX runs via Metal from Python, while ONNX Runtime Web uses Dawn/Metal from Chrome's WebGPU API. The WASM backend runs on CPU via onnxruntime-web's WebAssembly SIMD backend. ONNX Runtime's graph-level optimizations (operator fusion, memory planning) account for much of the speedup over MLX.
 
 ## Key Observations
 
@@ -211,7 +238,7 @@ The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-en
 
 2. **GPU bottleneck shifts to video decoding.** With GPU inference at 1.6s vs CPU at 28.4s, FFmpeg decode becomes the dominant stage (64% of GPU pipeline time).
 
-3. **MLX provides moderate forward pass speedup.** The M4's GPU accelerates inference 1.5x vs x86 CPU, but FFmpeg decode on macOS is slower, keeping end-to-end times comparable.
+3. **MLX is the slowest inference path on Apple Silicon.** Despite using the M4 GPU, MLX forward pass (965 ms/frame) is slower than both browser WASM on CPU (580 ms) and browser WebGPU on GPU (310 ms). Python overhead and lack of ONNX-level graph optimizations likely account for the difference.
 
 4. **UVQ 1.0 CompressionNet is expensive.** The 3D Inception network processing 16 patches per second takes 48s alone on CPU -- more than the entire UVQ 1.5 pipeline. On GPU it drops to 7.6s (6.3x speedup), making the full UVQ 1.0 pipeline 4.5x faster end-to-end.
 
@@ -219,7 +246,9 @@ The MLX backend forward pass is **1.5x faster** than i7-6700K CPU, but end-to-en
 
 6. **VRAM limits batch size.** The GTX 980 Ti (6 GB) can only fit batch_size=4 for 720p and batch_size=1 for 1080p. Modern GPUs with 8+ GB should handle batch_size=24. MLX uses unified memory so batch_size=24 works on 16 GB M4.
 
-7. **ONNX Runtime is faster per-frame than PyTorch CPU.** Graph-level optimizations in ONNX Runtime reduce single-frame inference to ~0.73s vs ~1.42s per frame in PyTorch. The same ONNX models power the browser WebGPU backend.
+7. **ONNX Runtime is faster per-frame than PyTorch CPU.** Graph-level optimizations in ONNX Runtime reduce single-frame inference to ~0.73s vs ~1.42s per frame in PyTorch on x86. On Apple Silicon, the same ONNX models via the browser WebGPU backend achieve 310 ms/frame — 3.1x faster than MLX and 4.6x faster than PyTorch CPU on x86.
+
+8. **WebGPU shader compilation adds first-frame overhead.** The WebGPU backend's first inference takes ~680 ms (vs steady-state 278 ms) due to WGSL compute shader compilation. Warmup is skipped due to an onnxruntime-web buffer lifecycle bug. Performance stabilizes by frame 3.
 
 ## Reproducing
 
@@ -239,4 +268,8 @@ uv run pytest -m "perf and mlx" -v -s
 uv sync --group onnx
 uv run python scripts/export_onnx.py
 cd uvq1p5_web && npm install && npm test
+
+# Browser WebGPU/WASM benchmarks (Chrome, secure context required)
+cd uvq1p5_web && npm run dev
+# Open https://localhost:5173 in Chrome, load a video file
 ```
