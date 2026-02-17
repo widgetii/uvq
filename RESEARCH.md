@@ -56,182 +56,413 @@ The content and distortion nets (EfficientNet-B0) use BatchNorm natively
 and work correctly on the NPU. The aggregation net is the only model
 that uses LayerNorm, and it is the only one that fails.
 
-## Research Questions
+---
 
-An AI research agent should investigate the following areas, in priority
-order. Each section describes what to look for, where to look, and what
-a useful answer looks like.
+## Research Findings
 
-### 1. Known RKNN LayerNorm Issues
+Research was conducted in February 2026 using web search, GitHub issue
+analysis, and RKNN documentation review. Four parallel investigations
+covered: known bugs, compiler options, ONNX graph workarounds, and
+quantization/debugging tools.
 
-**Goal**: Determine if this is a known bug with existing fixes or workarounds.
+### 1. Known RKNN LayerNorm Bugs — Confirmed Systemic Issue
 
-Search the rknn-toolkit2 GitHub repo for issues related to LayerNorm
-producing wrong results:
-- https://github.com/airockchip/rknn-toolkit2/issues
-- Search terms: `LayerNorm`, `layer_norm`, `exnorm`, `wrong result`,
-  `incorrect output`, `aggregation`
-- Also check closed issues — a fix may exist in a newer version or branch
+**LayerNorm on the RK3588 NPU via RKNN is a well-documented, unresolved
+problem.** Multiple GitHub issues confirm the `exNorm` operator (RKNN's
+fused replacement for LayerNorm) produces incorrect results on real NPU
+hardware.
 
-Check the RKNN documentation for any notes about LayerNorm limitations:
-- https://github.com/airockchip/rknn-toolkit2/tree/master/doc
-- The "supported ops" list may have caveats for LayerNorm
+| Issue | Repo | Model | Status | Key Finding |
+|---|---|---|---|---|
+| [#149](https://github.com/airockchip/rknn-toolkit2/issues/149) | airockchip | Stable Diffusion 1.5 | Closed (no fix) | exNorm cosine similarity dropped to **0.79**, Euclidean error **1036** |
+| [#186](https://github.com/airockchip/rknn-toolkit2/issues/186) | airockchip | Minimal LayerNorm(256) | **OPEN** | Maintainer acknowledged "suboptimal LayerNorm support" |
+| [#460](https://github.com/airockchip/rknn-toolkit2/issues/460) | airockchip | ViTTracker | **OPEN** | Toolkit 2.3.2, driver 0.9.6, RK3588 — same exNorm fusion bug |
+| [#322](https://github.com/airockchip/rknn-toolkit2/issues/322) | airockchip | Depth Anything v2 | Closed (no fix) | exNorm errors on **hardware** but not **simulator** — proves NPU runtime bug |
+| [#220](https://github.com/airockchip/rknn-toolkit2/issues/220) | airockchip | ConvNeXt | **OPEN** | Uses LayerNorm extensively, wrong outputs |
+| [#162](https://github.com/rockchip-linux/rknn-toolkit2/issues/162) | rockchip-linux | ONNX LayerNorm | **OPEN** | **"dimension -2 must be aligned to 16"** — NPU falls back to CPU |
 
-Check the Rockchip NPU community forums and Chinese developer communities
-(CSDN, Zhihu) for similar reports — many RK3588 users work in Chinese:
-- Search: `RKNN LayerNorm 结果不对` (wrong result)
-- Search: `RK3588 NPU LayerNorm`
+**Critical insight from issue #322**: The simulator produces correct results,
+but real NPU hardware does not. This proves the bug is in the **NPU runtime
+execution** of the `exNorm` operator, not in the compiler's graph
+transformation logic. The compiler generates correct instructions, but the
+NPU hardware executes them incorrectly.
 
-**Useful output**: Links to specific issues, confirmed bugs, or patches.
-Note the toolkit/driver versions mentioned in any fixes.
+**Critical insight from issue #162 (16-alignment constraint)**: The RKNN
+compiler log shows `"dimension -2 of first input must be aligned to 16"` and
+`"LayerNorm: Shape not support Target:NPU, turn to Target:CPU implement"`.
+Our aggregation net's LayerNorm operates on tensor `(1, 256, 4, 4)` — the
+spatial dimensions (4, 4) are **NOT 16-aligned**. In older toolkit versions
+(issue #162, ~2023), this caused a CPU fallback. In newer versions (2.3.x),
+the compiler appears to force NPU execution without the alignment check,
+producing silently wrong results instead of falling back to CPU. This
+16-alignment hardware constraint may be the root cause of the exNorm bug
+for small spatial dimensions.
 
-### 2. RKNN Compiler Options to Disable Problematic Fusions
+Despite RKNN changelogs mentioning "improved LayerNorm support" in versions
+1.5.0, 1.6.0, 2.0.0, 2.3.0, and 2.3.2, none of these changelog entries
+say "fixed incorrect LayerNorm results." The latest toolkit version remains
+**2.3.2** (April 2025) with no version 2.4 released or announced.
 
-**Goal**: Find `rknn.config()` or `rknn.build()` parameters that can
-disable the LayerNorm-to-ExNorm fusion or other aggressive optimizations.
+This is also a broader industry problem — NVIDIA TensorRT has documented
+FP16 LayerNorm overflow issues
+([TensorRT#2564](https://github.com/NVIDIA/TensorRT/issues/2564)).
 
-The RKNN compiler applies many optimization passes (visible in verbose
-build logs). Research whether any of these can be controlled:
+### 2. RKNN Compiler Options — Two Key Parameters Found
 
-- `rknn.config()` parameters beyond `target_platform` — are there
-  optimization level flags, fusion disable flags, or op-specific overrides?
-- `rknn.build()` parameters beyond `do_quantization` — check for
-  `optimization_level`, `disable_fuse`, or similar
-- Environment variables that control the RKNN compiler behavior
-- The `op_target` mechanism — can specific ops be forced to run on CPU
-  while the rest stays on NPU? The log shows `RKNNSetOpTargetPass` which
-  suggests per-op target assignment exists.
+#### `disable_rules` — Targeted Fusion Control
 
-Look at:
-- rknn-toolkit2 Python API source code (the `.pyx` files are compiled, but
-  docstrings and help() output may reveal parameters)
-- https://github.com/airockchip/rknn-toolkit2/tree/master/doc
-- RKNN Model Zoo examples that use advanced config options
-- Any `rknn.config()` examples with `optimization_level` or similar params
+The most promising parameter. Accepts a list of pass names and skips them
+during compilation:
 
-**Useful output**: Specific API calls or config parameters that could
-bypass the buggy fusion. Example: `rknn.config(disable_rules=["convert_layernorm_to_exnorm"])`.
+```python
+rknn.config(
+    target_platform="rk3588",
+    disable_rules=[
+        'convert_layernorm_to_exnorm',
+        'convert_exnorm_to_exnorm_mul_add',
+        'replace_mul_add_by_bn',
+    ],
+)
+```
 
-### 3. ONNX Graph Modifications to Avoid Triggering the Bug
+**Evidence this works**: The toolkit itself suggests this parameter in error
+messages. When a fusion rule causes a `KeyError`, the toolkit prints:
+> "You can add `disable_rules=['rule_name']` in `rknn.config()` to
+> temporarily disable the error rule!"
 
-**Goal**: Restructure the ONNX graph so the RKNN compiler doesn't apply
-the problematic LayerNorm → ExNorm → BatchNorm fusion chain.
+Observed in [ultralytics#20655](https://github.com/ultralytics/ultralytics/issues/20655)
+and [rknn_model_zoo#221](https://github.com/airockchip/rknn_model_zoo/issues/221).
 
-Possible approaches to investigate:
+Rule names come from verbose build logs. There is no public master list.
 
-a) **Replace LayerNorm with equivalent ops**: Decompose
-   `LayerNormalization` into its constituent operations (ReduceMean,
-   Sub, Pow, ReduceMean, Add, Sqrt, Div, Mul, Add) before feeding to
-   RKNN. If RKNN doesn't recognize the pattern, it may execute the
-   individual ops correctly. Tools: `onnxruntime.transformers` or
-   manual ONNX graph surgery.
+#### `optimization_level` — Global Optimization Control
 
-b) **Replace LayerNorm with GroupNorm or InstanceNorm**: These are
-   semantically similar normalization ops that RKNN may handle differently.
-   `LayerNorm([256,4,4])` on a `(1,256,4,4)` tensor normalizes over
-   all 256×4×4 = 4096 elements. `GroupNorm(num_groups=1, num_channels=256)`
-   is mathematically equivalent. Check if RKNN handles GroupNorm correctly.
+```python
+rknn.config(target_platform="rk3588", optimization_level=0)  # all off
+```
 
-c) **Replace LayerNorm with BatchNorm**: For batch_size=1, BatchNorm in
-   eval mode with carefully set running_mean/running_var could approximate
-   LayerNorm. However, this changes semantics (per-channel vs per-sample
-   normalization) so needs careful analysis.
+- Level 0: All optimizations disabled
+- Level 3: All optimizations enabled (default)
+- Levels 1–2: Intermediate (only documented in official PDF)
 
-d) **Insert identity ops to break fusion patterns**: Adding a no-op
-   (e.g., Mul by 1.0 or Add 0.0) between Conv2d output and LayerNorm
-   input might prevent the compiler from recognizing the fusable pattern.
+Disables ALL fusions, not just LayerNorm. Performance degrades.
 
-For each approach, verify:
-1. The modified ONNX produces identical (or very close) results to the
-   original when run via ONNX Runtime
-2. The RKNN compiler accepts it without errors
-3. The NPU produces correct results
+#### Per-Op CPU Fallback — Does NOT Exist
 
-**Useful output**: A concrete ONNX graph transformation recipe that works.
-Include code for the transformation and test results.
+Despite `RKNNSetOpTargetPass` appearing in build logs, there is **no user-facing
+API** to assign individual ops to CPU vs NPU. RKNN is a static compiler — if an
+op is not supported, the entire conversion fails. There is no `op_target`
+parameter or `cpu_fallback=True` flag.
 
-### 4. RKNN Op Target Assignment (Hybrid at Op Level)
+### 3. ONNX Graph Workarounds — Three Methods to Decompose LayerNorm
 
-**Goal**: Instead of running the whole model on NPU or whole model on CPU,
-run most ops on NPU but force LayerNorm to CPU within the same RKNN model.
+Since the bug is triggered by the `LayerNormalization` ONNX node being
+converted to `exNorm`, removing that node eliminates the problem entirely.
 
-The RKNN verbose build log shows a `RKNNSetOpTargetPass` phase. Research:
+#### Method A: Export aggregation net at ONNX opset 16
 
-- Is there an API to set per-op targets (NPU vs CPU)?
-- The `rknn.config()` function may accept an `op_target` parameter or
-  similar mechanism
-- Some RKNN documentation mentions "fallback to CPU" for unsupported ops —
-  can this be forced for specific ops even if they are technically supported?
-- Check RKNN Model Zoo for examples using mixed NPU/CPU execution
+At opset < 17, PyTorch auto-decomposes `nn.LayerNorm` into primitives
+(`ReduceMean`, `Sub`, `Pow`, `Sqrt`, `Div`, `Mul`, `Add`). Currently
+`scripts/export_onnx.py` uses `opset_version=17` (line 143).
 
-This would be the ideal solution: the aggregation net stays as a single
-RKNN model, but LayerNorm executes on CPU while everything else uses NPU.
+Changing to `opset_version=16` for the aggregation net eliminates the
+`LayerNormalization` node. The primitive ops are all supported by RKNN
+across opset 12–19.
 
-**Useful output**: API calls to force specific ops to CPU, or documentation
-confirming this is/isn't possible.
+**Caveat**: RKNN recommends opset 19 and warns about lower opsets. Also,
+this changes the opset for all three models unless export is split.
 
-### 5. Alternative: Merging All Three Models into One RKNN Model
+#### Method B: `onnx.inliner` post-processing (cleanest)
 
-**Goal**: Investigate whether merging content_net + distortion_net +
-aggregation_net into a single ONNX model and converting as one unit
-changes the RKNN compiler's behavior.
+Decompose `LayerNormalization` using ONNX's own function definition while
+keeping opset 17:
 
-Currently we have three separate models. A single end-to-end model would:
-- Allow the compiler to see the full graph and potentially optimize
-  differently
-- Eliminate inter-model data transfer overhead
-- Potentially trigger different fusion rules
+```python
+import onnx
+import onnx.inliner
 
-Concerns:
-- The distortion net processes 9 patches — the merged model would need
-  to handle this (either via a loop in pre-processing, or by accepting
-  pre-tiled inputs)
-- A larger model may hit RKNN memory limits
-- The bug may persist regardless
+model = onnx.load("aggregation_net.onnx")
+decomposed = onnx.inliner.inline_selected_functions(
+    model,
+    function_ids=[("", "LayerNormalization")],
+    exclude=False,
+    inline_schema_functions=True,
+)
+onnx.save(decomposed, "aggregation_net_decomposed.onnx")
+```
 
-**Useful output**: Whether single-model conversion changes the compiler's
-treatment of the LayerNorm ops, and if so, whether the NPU output is correct.
+Requires `onnx >= 1.15`. RKNN toolkit 2.3.x pins `onnx==1.16.2`, so this
+should work in that environment.
 
-### 6. INT8 Quantization as a Workaround
+#### Method C: Manual graph surgery with onnx-graphsurgeon
 
-**Goal**: Test whether INT8 quantization of the aggregation net bypasses
-the FP16 bug.
+Replace the `LayerNormalization` node with explicit ReduceMean → Sub →
+Mul → ReduceMean → Add → Sqrt → Reciprocal → Mul → Mul → Add subgraph.
+Most control but most code.
 
-RKNN supports INT8 quantization via `rknn.build(do_quantization=True,
-dataset=calibration.txt)`. Quantized models use a different execution
-path on the NPU. Research:
+#### GroupNorm(1) — NOT viable
 
-- Does INT8 quantization change which NPU instructions are used?
-- Are there reports of FP16 bugs being fixed by switching to INT8?
-- What calibration data would be needed? (Feature tensors, not raw images)
-- What accuracy loss is acceptable? The aggregation net has small dynamic
-  range ([1, 5] output), so INT8 might work well.
+`GroupNorm(num_groups=1)` is mathematically equivalent to LayerNorm, but
+RKNN lists `GroupNormalization` as **"Not supported"** in the OP support
+docs. It would fail to convert or fall back to CPU.
 
-**Useful output**: Whether INT8 execution produces correct results, and
-what the accuracy trade-off is.
+#### RKNN pattern re-detection risk
 
-### 7. RKNN-Toolkit2 Source-Level Analysis
+Even with decomposed primitives, the RKNN compiler has a
+`replace_torch_layernorm` pass that detects the ReduceMean+Sub+Pow+...
+pattern and re-fuses it into LayerNorm → exNorm. This pass would need to
+be disabled via `disable_rules=['replace_torch_layernorm']` to prevent
+re-detection.
 
-**Goal**: Understand the ExNorm implementation to determine if the bug is
-in the compiler or the NPU runtime.
+### 4. Quantization and Debugging Tools
 
-The RKNN toolkit is partially open-source. Investigate:
+#### INT8 uses different NPU hardware
 
-- The `rknn/api/` Python files (some are `.pyx` Cython) — look for
-  ExNorm implementation or configuration
-- The `librknnc` compiler library — any symbols or debug options related
-  to normalization
-- The `librknnrt` runtime library — any debug environment variables that
-  dump intermediate tensor values
-- Is there a way to dump the compiled NPU instructions to verify the
-  LayerNorm transformation is mathematically correct?
+INT8 and FP16 use different MAC units on the RK3588 NPU:
+- **INT8**: 1024 ops/cycle (3 TOPS total)
+- **FP16**: 512 ops/cycle (1.5 TOPS total)
 
-Check if `RKNN_LOG_LEVEL` or similar environment variables exist for
-runtime debugging.
+INT8 quantization triggers a completely different compilation path and may
+bypass the FP16 exNorm bug. However, with only 4096 elements in the
+aggregation net's tensors, quantization to 256 discrete levels risks
+significant precision loss.
 
-**Useful output**: Understanding of whether the bug is in compilation
-(wrong instruction generation) or execution (correct instructions, wrong
-NPU behavior). This determines whether a software fix is possible.
+#### Hybrid quantization — per-layer precision control
+
+RKNN supports a 3-step hybrid quantization workflow that allows keeping
+specific layers in FP32 while quantizing others to INT8:
+
+```python
+# Step 1: Generate config
+rknn.hybrid_quantization_step1(dataset='calibration.txt')
+# Step 2: Edit .quantization.cfg — set LayerNorm layers to float32
+# Step 3: Build with modified config
+rknn.hybrid_quantization_step2(
+    model_input='model.model',
+    data_input='model.data',
+    model_quantization_cfg='model.quantization.cfg')
+```
+
+Also available in v2.3.2: `auto_precision=True` and
+`mixed_precision_dot_node_list=['layer_name', ...]` in `rknn.config()`.
+
+#### Debugging tools
+
+| Tool | Usage | Notes |
+|---|---|---|
+| `accuracy_analysis()` | PC-side, compares per-layer reference vs RKNN | Best for pinpointing divergent layers |
+| `NN_LAYER_DUMP=1` | On-device env var, dumps per-layer tensors | Very slow (>80s), undocumented output location |
+| `RKNN_LOG_LEVEL=5` | On-device env var, verbose runtime logging | Shows per-layer MACs and bandwidth |
+| `eval_perf()` | PC-side, per-layer timing | Requires `perf_debug=True` in `init_runtime()` |
+
+`accuracy_analysis()` cannot be called on pre-built `.rknn` models — must
+start from the original ONNX and go through the full conversion pipeline.
+
+### 5. Cross-Reference with Independent Research (ChatGPT Deep Research)
+
+An independent investigation using ChatGPT Deep Research was conducted in
+parallel to validate findings. The cross-reference identified one significant
+new finding and confirmed all major conclusions.
+
+**New finding — 16-alignment constraint (issue #162)**: The ChatGPT research
+surfaced [rockchip-linux/rknn-toolkit2#162](https://github.com/rockchip-linux/rknn-toolkit2/issues/162),
+which we had missed. This issue reveals the NPU's exNorm implementation
+requires `dimension -2` (height) to be a multiple of 16. Our tensor
+`(1, 256, 4, 4)` violates this constraint. This is potentially the most
+important finding — it suggests the exNorm hardware simply cannot handle
+4x4 spatial dimensions correctly, regardless of toolkit or driver version.
+
+**Confirmed by both investigations**:
+- exNorm fusion chain is the root cause
+- Simulator and hardware diverge (bug is in NPU execution)
+- `disable_rules` can selectively disable fusion passes
+- ONNX opset 16 decomposes LayerNorm into primitives
+- `optimization_level=0` disables all fusions
+- Per-op CPU fallback does NOT exist in RKNN
+
+**Items found only by our research (not in ChatGPT report)**:
+- `disable_rules` actual parameter name and evidence from toolkit error messages
+- `replace_torch_layernorm` re-detection risk when using decomposed primitives
+- `accuracy_analysis()` API for per-layer debugging
+- `NN_LAYER_DUMP=1` environment variable
+- Hybrid quantization 3-step workflow
+- `auto_precision` and `mixed_precision_dot_node_list` (v2.3.2)
+- Issues #186, #322, #359, #220 (4 additional issues beyond ChatGPT's 2)
+- Issue #322's proof that simulator is correct but hardware is wrong
+
+**Items found only by ChatGPT (not in our initial research)**:
+- Issue #162 with the 16-alignment constraint (added above)
+- Suggestion to file a bug report directly with Rockchip support
+
+**Items rated low-confidence by ChatGPT, confirmed negative by our research**:
+- GroupNorm(1) replacement → NOT viable (GroupNorm is "Not Supported" in RKNN)
+- Per-op CPU/NPU target assignment → does NOT exist as a user-facing API
+- Model merging → untested, low priority given the root cause is now understood
+
+---
+
+### 6. Root Cause Found: FP16 Overflow in Conv2d (Experimental)
+
+**The actual root cause is NOT LayerNorm/exNorm — it is FP16 overflow in
+the Conv2d(256→256, 1×1) layer that precedes LayerNorm.**
+
+This was discovered by isolating individual operations on the NPU:
+
+1. Exported JUST the Conv2d as a standalone RKNN model
+2. Fed it the real intermediate tensors from the pipeline
+3. Conv2d alone produces cosine similarity of **-0.01** (random output)
+
+The FP16 overflow chain:
+
+```
+Input to Conv2d:   (1, 256, 4, 4)  std ≈ 283,  abs_max ≈ 2,767
+Output from Conv2d: (1, 256, 4, 4)  std ≈ 2,093, abs_max ≈ 87,365
+FP16 max value:     65,504
+Values exceeding FP16 range: 2 out of 4,096 (plus many near the limit)
+```
+
+The NPU computes Conv2d in FP16 (half-precision float, max ≈ 65,504). The
+Conv2d output contains values up to 87,365, which overflow FP16 and become
+`inf` or garbage. This corrupts everything downstream — LayerNorm receives
+garbage input, produces garbage output, and the final score saturates.
+
+**Why this was misdiagnosed as a LayerNorm bug**: LayerNorm is the first
+operation that produces a "visible" error because it tries to normalize
+already-corrupted values. The exNorm fusion discussion in GitHub issues
+is a red herring — the real problem is FP16 overflow in the preceding
+Conv2d, which happens BEFORE LayerNorm/exNorm even runs.
+
+**Why the content/distortion nets work**: EfficientNet-B0 uses BatchNorm
+after every Conv2d, which constrains intermediate values to a narrow
+range (mean ≈ 0, std ≈ 1). The aggregation net's Conv2d(256→256, 1×1)
+has no such constraint — its input (from AdaptiveAvgPool2d) has std ≈ 283,
+and the Conv2d amplifies this to std ≈ 2,093, exceeding FP16 range.
+
+**This is the same class of bug as**
+[TensorRT#2564](https://github.com/NVIDIA/TensorRT/issues/2564) and
+[PyTorch#66707](https://github.com/pytorch/pytorch/issues/66707) — FP16
+overflow in intermediate computations. The standard solution is mixed
+precision: run overflow-prone layers in FP32.
+
+## Assessment
+
+**The root cause is FP16 overflow, not a LayerNorm/exNorm bug.** The
+aggregation net's Conv2d(256→256, 1×1) produces values exceeding the
+FP16 range (65,504), and the RKNN NPU computes in FP16 by default with
+no automatic overflow protection. All previous experiments (opset 16
+decomposition, disable_rules, optimization_level=0) failed because they
+all still compute Conv2d in FP16.
+
+This reframes the solution space:
+
+1. **The current hybrid approach (ONNX Runtime on CPU) is the correct
+   production solution.** CPU runs in FP32, avoiding the overflow entirely.
+   The aggregation net is tiny (0.2 MB, 14 ops, <1ms on CPU). Full NPU
+   execution is not worth the complexity of working around a fundamental
+   precision limitation.
+
+2. **Model-level fix (if retraining were possible)**: Add BatchNorm or
+   weight scaling before the Conv2d to constrain intermediate values within
+   FP16 range. This would require retraining the model.
+
+3. **RKNN-level fix (if it exists)**: Force specific layers to run in FP32
+   using `mixed_precision_dot_node_list` or similar. However, RKNN does
+   not clearly support per-layer FP32 override for non-quantized models.
+
+## Experiments Completed
+
+### Experiment A: Decompose LayerNorm (opset 16) + `disable_rules`
+
+**Result: FAIL** — NPU score 1.009766 (expected 3.349337)
+
+Exported aggregation_net.onnx at opset 16 (24 primitive nodes, no
+`LayerNormalization`), with `disable_rules=['replace_torch_layernorm']`.
+Verified ONNX matches PyTorch (0.00 diff). Build log shows no `exNorm`.
+NPU still outputs 1.009766. **Decomposing LayerNorm does not fix the
+bug because the overflow happens in Conv2d BEFORE LayerNorm runs.**
+
+### Experiment B: `optimization_level=0` — all fusions disabled
+
+**Result: FAIL** — `optimization_level=0` does NOT prevent re-fusion.
+Build log still shows `replace_torch_layernorm` running and creating
+`exNorm`. The parameter only controls later-stage optimizations, not
+the initial graph pattern matching.
+
+### Experiment C: All 4 `disable_rules` combined
+
+**Result: FAIL** — NPU score 1.009766
+
+Used `disable_rules=['replace_torch_layernorm',
+'convert_layernorm_to_exnorm', 'convert_exnorm_to_exnorm_mul_add',
+'replace_mul_add_by_bn']`. Build log confirmed zero `exNorm` nodes.
+NPU output was still wrong. **This proves the bug is not in exNorm
+fusion — it's in the preceding Conv2d.**
+
+### Experiment D: Isolated Conv2d on NPU
+
+**Result: FAIL** — cosine similarity -0.01 (random output)
+
+Exported only Conv2d(256→256, 1×1) as a standalone RKNN model and tested
+with real pipeline inputs (std ≈ 283). NPU output mean: -13.6 vs
+reference -142.3. Conv2d output abs_max is 87,365, exceeding FP16 max
+(65,504). **This is the root cause: FP16 overflow.**
+
+## Action Items
+
+Revised based on the FP16 overflow root cause. The LayerNorm-related
+experiments are now moot.
+
+### Accept the hybrid pipeline as the production solution
+
+**What**: Keep the current architecture — content and distortion nets on
+NPU, aggregation net on CPU via ONNX Runtime.
+
+**Why**: The FP16 overflow is a fundamental precision limitation, not a
+software bug. The aggregation net's Conv2d produces values exceeding
+FP16 range (87,365 > 65,504) with real pipeline inputs. No amount of
+fusion control, graph surgery, or compiler flags can fix a hardware
+precision limit.
+
+**The ONNX Runtime CPU path is correct**: It runs in FP32 and produces
+the right score (3.37 vs reference 3.35, diff 0.023). The aggregation
+net is tiny (0.2 MB, 14 ops, <2 ms on CPU). The performance bottleneck
+is the EfficientNet feature extractors (already on NPU).
+
+### Revert export_onnx.py and export_rknn.py changes
+
+**What**: Revert the opset_version parameter addition in `export_onnx.py`
+and the `disable_rules` addition in `export_rknn.py`. These were
+experimental changes that did not produce a working fix.
+
+### Optional: Investigate RKNN FP32 mode or input scaling
+
+If full NPU execution is desired in the future, these avenues remain:
+
+1. **`float_dtype='float32'`** in `rknn.config()` — if supported, this
+   would force the NPU to compute in FP32 instead of FP16. However,
+   the RK3588 NPU may not support FP32 at all (only FP16 and INT8).
+
+2. **Input pre-scaling**: Scale the aggregation net inputs down before
+   Conv2d (divide by a constant, e.g., 256) and scale the output back
+   up. This keeps intermediate values within FP16 range. Would require
+   modifying the ONNX model or the model weights directly.
+
+3. **Model retraining**: Add BatchNorm after Conv2d or use weight
+   initialization that constrains the output range. Not practical for
+   pre-trained weights.
+
+### Optional: File a feature request with Rockchip
+
+**What**: File an issue on airockchip/rknn-toolkit2 requesting automatic
+FP16 overflow detection and mixed-precision fallback for layers that
+produce out-of-range values. Include our Conv2d(256→256, 1×1) reproducer
+with input std ≈ 283, output abs_max ≈ 87,365 > FP16 max 65,504.
+
+Note: Many of the "LayerNorm bugs" reported in issues #149, #186, #322,
+#460 may also be FP16 overflow in preceding layers, not actual exNorm
+implementation bugs. This insight could help other RKNN users.
+
+---
 
 ## Files to Reference
 
@@ -294,3 +525,39 @@ The research is successful if it finds **any** of:
 
 Even partial results are valuable — e.g., confirming that the bug is in
 the compiler (not the NPU hardware) narrows the solution space.
+
+## Sources
+
+### RKNN GitHub Issues
+- [#149 — NPU LayerNorm severe precision loss (Stable Diffusion)](https://github.com/airockchip/rknn-toolkit2/issues/149)
+- [#186 — LayerNorm results incorrect (OPEN)](https://github.com/airockchip/rknn-toolkit2/issues/186)
+- [#460 — ViTTracker incorrect inference after operator fusion (OPEN)](https://github.com/airockchip/rknn-toolkit2/issues/460)
+- [#322 — Depth Anything v2 simulator vs device mismatch](https://github.com/airockchip/rknn-toolkit2/issues/322)
+- [#359 — unsupport cpu exNorm op](https://github.com/airockchip/rknn-toolkit2/issues/359)
+- [#220 — ConvNeXt wrong output results (OPEN)](https://github.com/airockchip/rknn-toolkit2/issues/220)
+- [#162 — LayerNorm 16-alignment constraint (rockchip-linux repo)](https://github.com/rockchip-linux/rknn-toolkit2/issues/162)
+
+### RKNN Documentation
+- [OP Support v2.3.2](https://github.com/airockchip/rknn-toolkit2/blob/master/doc/RKNNToolKit2_OP_Support-2.3.2.md)
+- [API Differences doc](https://github.com/airockchip/rknn-toolkit2/blob/master/doc/RKNNToolKit2_API_Difference_With_Toolkit1-2.3.2.md)
+- [CHANGELOG.md](https://github.com/airockchip/rknn-toolkit2/blob/master/CHANGELOG.md)
+- [Official PDF docs](https://github.com/airockchip/rknn-toolkit2/tree/master/doc)
+
+### `disable_rules` Evidence
+- [ultralytics#20655 — toolkit suggests disable_rules in error message](https://github.com/ultralytics/ultralytics/issues/20655)
+- [rknn_model_zoo#221 — same disable_rules suggestion](https://github.com/airockchip/rknn_model_zoo/issues/221)
+
+### ONNX Decomposition
+- [onnx.inliner API](https://onnx.ai/onnx/api/inliner.html)
+- [PR #6931 — inline_schema_functions support](https://github.com/onnx/onnx/pull/6931)
+- [LayerNormalization function definition](https://onnx.ai/onnx/operators/onnx__LayerNormalization.html)
+
+### Related Industry Issues
+- [TensorRT#2564 — FP16 LayerNorm overflow](https://github.com/NVIDIA/TensorRT/issues/2564)
+- [PyTorch#66707 — LayerNorm needs FP32 for FP16 inputs](https://github.com/pytorch/pytorch/issues/66707)
+- [rknn_model_zoo#314 — Whisper INT8 quantization produces garbage](https://github.com/airockchip/rknn_model_zoo/issues/314)
+
+### Architecture References
+- [DeepWiki — RKNN Model Conversion Process](https://deepwiki.com/airockchip/rknn-toolkit2/3.1-model-conversion-process)
+- [DeepWiki — RKNN System Architecture](https://deepwiki.com/airockchip/rknn-toolkit2/2-rknn-system-architecture)
+- [RKNN ONNX Opset Compatibility Guide](https://zediot.com/blog/rknn-onnx-opset-compatibility/)
