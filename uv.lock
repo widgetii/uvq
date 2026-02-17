@@ -1672,6 +1672,7 @@ onnx = [
     { name = "onnxruntime" },
 ]
 rknn = [
+    { name = "onnxruntime" },
     { name = "opencv-python" },
 ]
 
@@ -1700,4 +1701,7 @@ onnx = [
     { name = "onnx", specifier = ">=1.17.0" },
     { name = "onnxruntime", specifier = ">=1.21.0" },
 ]
-rknn = [{ name = "opencv-python", specifier = ">=4.8.0" }]
+rknn = [
+    { name = "onnxruntime", specifier = ">=1.17.0" },
+    { name = "opencv-python", specifier = ">=4.8.0" },
+]

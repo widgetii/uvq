@@ -1,7 +1,7 @@
 # RKNN Porting Notes
 
 Findings from porting UVQ 1.5 to the Rockchip RK3588S NPU (Orange Pi 5 Plus)
-via the RKNN framework. Tested February 2026 on two boards with different
+via the RKNN framework. Tested February 2026 on three boards with different
 kernel/driver configurations.
 
 ## Architecture overview
@@ -35,6 +35,7 @@ PyTorch-to-RKNN converter.
 ## rknn-toolkit2 installation (PC, x86_64)
 
 Wheels are in `rknn-toolkit2/packages/x86_64/`. Available for Python 3.7–3.12.
+The latest version as of February 2026 is **2.3.2**.
 
 ### Dependency conflicts
 
@@ -53,7 +54,7 @@ conflict with modern Python environments:
 ```bash
 python3.12 -m venv /tmp/rknn-venv
 /tmp/rknn-venv/bin/pip install "setuptools<81"
-/tmp/rknn-venv/bin/pip install /path/to/rknn_toolkit2-2.3.0-cp312-cp312-manylinux_2_17_x86_64.whl
+/tmp/rknn-venv/bin/pip install /path/to/rknn_toolkit2-2.3.2-cp312-cp312-manylinux_2_17_x86_64.whl
 /tmp/rknn-venv/bin/pip install "onnx==1.16.2"
 /tmp/rknn-venv/bin/pip install "torch==2.4.0+cpu" "torchvision==0.19.0+cpu" \
     --index-url https://download.pytorch.org/whl/cpu
@@ -61,6 +62,17 @@ python3.12 -m venv /tmp/rknn-venv
 
 The rknn-toolkit2 wheel pulls in CUDA torch by default (~5 GB). Use the CPU
 index to avoid this if you only need the conversion step.
+
+The wheels and runtime libraries can also be downloaded individually from the
+GitHub API without cloning the full repo (~2.5 GB):
+
+```bash
+# On an aarch64 board — download lite2 wheel and librknnrt.so directly
+curl -L -o rknn_lite2.whl \
+  'https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknn-toolkit-lite2/packages/rknn_toolkit_lite2-2.3.2-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl'
+curl -L -o librknnrt.so \
+  'https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so'
+```
 
 ## ONNX → RKNN conversion issues
 
@@ -148,19 +160,18 @@ The model builds and exports successfully.
 **This is the most important finding and drove the final architecture.**
 
 The `aggregation_net.rknn` model produces completely wrong scores when run
-on the NPU with driver version 0.8.2 (BSP kernel 5.10.110). Content and
+on the NPU. This was tested across **two different NPU driver versions** and
+**two different toolkit versions** — all combinations fail. Content and
 distortion nets work correctly, but the aggregation net outputs saturated
 values (~1.0 or ~5.0) instead of the correct score.
 
-Systematic testing on the Orange Pi 5 Plus (BSP 5.10, driver 0.8.2):
+Systematic testing across boards and toolkit versions:
 
-| Pipeline | Score | Correct? |
-|---|---|---|
-| PyTorch FP32 (PC) | 3.3493 | reference |
-| ONNX Runtime CPU (board) | 3.3493 | yes |
-| RKNN NPU content+distortion + ONNX agg | 3.3509 | yes (within FP16 tolerance) |
-| RKNN NPU all three models | 1.0098 | **no** |
-| RKNN NPU aggregation only (PyTorch features as input) | 1.0098 | **no** |
+| Board | NPU driver | Toolkit export | NPU agg score | ONNX agg score | Reference |
+|---|---|---|---|---|---|
+| Board 2 (BSP 5.10) | 0.8.2 | 2.3.0 | **1.0098** | 3.3509 | 3.3493 |
+| Board 3 (BSP 6.1) | 0.9.6 | 2.3.0 | **1.0098** | 3.3509 | 3.3493 |
+| Board 3 (BSP 6.1) | 0.9.6 | 2.3.2 | **4.9922** | 3.3509 | 3.3493 |
 
 Key observations:
 - The content and distortion net NPU outputs match PyTorch within FP16
@@ -169,17 +180,31 @@ Key observations:
   exact PyTorch-computed features produces wrong output
 - All `data_format` combinations (`nchw`, `nhwc`, default) give the
   same wrong result
-- Re-exporting with toolkit 2.3.0 (matching the runtime version) did
-  not help — the toolkit 2.3.2 exports also fail identically
-- The runtime warns: `Current driver version: 0.8.2, recommend to
-  upgrade to >= 0.8.8`
+- Re-exporting with toolkit 2.3.2 (matching the runtime version) did
+  not fix it — it changed the wrong value from 1.0098 to 4.9922
+  (saturated to the opposite end of the 0–5 scale)
+- Upgrading the NPU driver from 0.8.2 to 0.9.6 did not fix it either
+- The bug is **not a version mismatch issue** — it reproduces across all
+  tested combinations of toolkit (2.3.0, 2.3.2) and driver (0.8.2, 0.9.6)
 
-The likely cause is NPU driver 0.8.2 mishandling one of the operations
-in the aggregation net. The aggregation net uses LayerNorm, concat,
-Conv2d, MaxPool, Linear, and Tanh — a different mix from the EfficientNet-based
-content/distortion nets which use BatchNorm, SiLU, DepthwiseSeparableConv,
-and SE blocks. LayerNorm is the most probable culprit as it is less
-commonly supported by NPU accelerators.
+The RKNN compiler's verbose build log reveals how it transforms the
+aggregation net's operations:
+
+```
+convert_layernorm_to_exnorm:  LayerNorm → ExNorm (custom RKNN op)
+convert_exnorm_to_exnorm_mul_add:  ExNorm → Norm + Mul + Add
+replace_mul_add_by_bn:  Mul + Add → BatchNormalization (fused)
+convert_gemm_by_exmatmul:  Gemm → custom ExMatMul
+convert_exmatmul_to_conv:  ExMatMul → Conv2d
+```
+
+The aggregation net uses LayerNorm, concat, Conv2d, MaxPool, Linear, and
+Tanh — a different mix from the EfficientNet-based content/distortion nets
+which use BatchNorm, SiLU, DepthwiseSeparableConv, and SE blocks. The
+aggressive fusion of LayerNorm → ExNorm → BatchNormalization is the most
+probable cause, as this chain replaces the original operation semantics
+with a fused approximation that appears to be numerically incorrect for
+this model's parameter values.
 
 **Workaround: hybrid pipeline.** The production code runs content and
 distortion nets on the NPU via RKNN-Lite, and the aggregation net on
@@ -202,8 +227,8 @@ Without this, the runtime silently reinterprets the memory layout, producing
 garbage output. There is no error or warning — the shapes may even look
 correct, but the values will be wrong.
 
-On real hardware (tested with librknnrt 2.3.0), passing `data_format='nchw'`
-causes the runtime to print:
+On real hardware (tested with librknnrt 2.3.0 and 2.3.2), passing
+`data_format='nchw'` causes the runtime to print:
 
 ```
 W The input[0] need NHWC data format, but NCHW set, the data format
@@ -263,7 +288,7 @@ difference doesn't affect the reference comparison.
 
 ## Hardware: Orange Pi 5 Plus (RK3588S)
 
-We tested on two boards with different OS/kernel configurations.
+We tested on three boards with different OS/kernel configurations.
 
 ### Board 1: Mainline kernel (NPU unavailable)
 
@@ -385,6 +410,73 @@ Summary of the version stack on Board 2:
 | Python runtime (rknn-toolkit-lite2) | 2.3.0 | Yes (pip install) |
 | Conversion toolkit (rknn-toolkit2) | 2.3.0 | Yes (pip install, x86_64 only) |
 
+### Board 3: BSP 6.1 kernel (NPU functional, newer driver)
+
+- **OS**: Ubuntu 22.04.5 LTS (Orange Pi 1.2.0 official image, November 2024)
+- **Kernel**: 6.1.43-rockchip-rk3588 (Rockchip vendor BSP)
+- **NPU driver**: rknpu **0.9.6** (2024-03-22)
+- **NPU status**: functional (same aggregation net bug as Board 2)
+- **RAM**: 16 GB, **CPU**: 8 cores (4× A76 + 4× A55)
+- **Storage**: eMMC (28 GB) — has intermittent I/O errors (see below)
+
+This is a more recent official Orange Pi image with a newer BSP kernel (6.1
+vs 5.10). The NPU driver is significantly newer (0.9.6 vs 0.8.2), which was
+the reason for testing on this board — to check if the aggregation net bug
+was driver-version-specific. It was not.
+
+#### dmesg output on boot
+
+```
+RKNPU fdab0000.npu: Adding to iommu group 0
+RKNPU fdab0000.npu: RKNPU: rknpu iommu is enabled, using iommu mode
+RKNPU fdab0000.npu: can't request region for resource [mem 0xfdab0000-0xfdabffff]
+RKNPU fdab0000.npu: can't request region for resource [mem 0xfdac0000-0xfdacffff]
+RKNPU fdab0000.npu: can't request region for resource [mem 0xfdad0000-0xfdadffff]
+[drm] Initialized rknpu 0.9.6 20240322 for fdab0000.npu on minor 1
+```
+
+Unlike Board 2, this board does not show "failed to initialize power model"
+warnings. The driver version is 0.9.6 (March 2024) vs 0.8.2 (August 2022).
+
+#### Version stack
+
+| Component | Version | Notes |
+|---|---|---|
+| NPU kernel driver (rknpu) | 0.9.6 | Built into kernel 6.1.43 |
+| C runtime (librknnrt.so) | 2.3.2 | Updated from pre-installed 1.4.0 |
+| Python runtime (rknn-toolkit-lite2) | 2.3.2 | Installed from GitHub |
+| Conversion toolkit (rknn-toolkit2) | 2.3.2 | On PC |
+
+All version components match at 2.3.2, including the NPU driver (0.9.6
+satisfies the ≥0.8.8 recommendation from the runtime). Despite this,
+the aggregation net NPU bug persists.
+
+#### eMMC I/O errors
+
+This board's eMMC storage has intermittent I/O errors that cause `dpkg`,
+`git clone`, and other disk-heavy operations to fail:
+
+```
+dpkg: unrecoverable fatal error, aborting:
+ unable to fsync updated status of 'python3-wheel': Input/output error
+```
+
+**Workaround**: Install Python packages to tmpfs (RAM-backed):
+
+```bash
+pip install --target=/tmp/pylibs package_name
+PYTHONPATH=/tmp/pylibs python3 script.py
+```
+
+The eMMC issue is hardware-specific (likely a worn or faulty eMMC chip) and
+unrelated to the RKNN software stack.
+
+#### Pre-installed librknnrt.so is ancient
+
+Same as Board 2: the factory image ships with librknnrt.so **1.4.0**
+(September 2022), which rejects RKNN model format version 6. Must be
+updated before any RKNN models can be loaded.
+
 ## Testing without PyTorch on the device
 
 The standard cross-backend test pattern (load both models, feed same input,
@@ -443,10 +535,12 @@ but was not tested.
 | ONNX dynamic batch axes rejected | Pass `inputs` + `input_size_list` to `load_onnx()` |
 | Simulator rejects NCHW inputs | Skip simulator verification; works on real hardware |
 | Default data_format is NHWC | Always pass `data_format='nchw'` to `inference()` |
-| Aggregation net wrong on NPU | Run aggregation via ONNX Runtime on CPU |
+| Aggregation net wrong on NPU | Run aggregation via ONNX Runtime on CPU (bug persists across drivers 0.8.2–0.9.6 and toolkits 2.3.0–2.3.2) |
 | librknnrt.so version mismatch | Update librknnrt.so to match the toolkit version |
 | No `/dev/rknpu*` on BSP 5.10 | NPU is at `/dev/dri/renderD129`; check `init_runtime()` not device nodes |
 | No PyTorch on device for testing | Pre-computed reference.json with numpy-seeded inputs |
 | Ubuntu 24.10 repos gone (EOL) | Switch apt sources to `old-releases.ubuntu.com` |
 | rknn-toolkit2 needs old onnx | Pin `onnx==1.16.2` |
 | rknn-toolkit2 needs pkg_resources | Pin `setuptools<81` |
+| eMMC I/O errors on some boards | Install packages to tmpfs: `pip install --target=/tmp/pylibs` |
+| Full repo clone too large (~2.5 GB) | Download individual wheels and libs via GitHub raw URLs |
