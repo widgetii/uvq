@@ -34,6 +34,12 @@
   <div id="status">Initializing...</div>
 
   <div id="file-input-area" style="display: none;">
+    <label for="decode-method">Decode method: </label>
+    <select id="decode-method">
+      <option value="video-element">&lt;video&gt; element</option>
+      <option value="webcodecs">WebCodecs API</option>
+    </select>
+    <br><br>
     <input type="file" id="video-file" accept="video/*">
   </div>
 

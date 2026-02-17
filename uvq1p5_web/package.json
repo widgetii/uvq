@@ -5,6 +5,7 @@
   "type": "module",
   "description": "UVQ 1.5 video quality assessment in the browser via ONNX Runtime WebGPU",
   "dependencies": {
+    "mp4box": "^0.5.2",
     "onnxruntime-web": "1.21.0"
   },
   "devDependencies": {

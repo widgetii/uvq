@@ -2,13 +2,14 @@
  * UVQ 1.5 browser entry point.
  *
  * Loads ONNX models via onnxruntime-web with WebGPU and WASM backends,
- * extracts video frames via <video> + canvas, runs per-frame inference
- * on both backends, and displays a performance comparison.
+ * extracts video frames via a pluggable decoder (video element or WebCodecs),
+ * runs per-frame inference on both backends, and displays a performance comparison.
  */
 
 import * as ort from "onnxruntime-web/webgpu";
 import { UVQ } from "./uvq.js";
 import { preprocessFrame } from "./preprocessing.js";
+import { VideoElementDecoder, WebCodecsDecoder } from "./decoder.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -16,6 +17,7 @@ const statusEl = $("#status");
 const errorEl = $("#error-banner");
 const fileArea = $("#file-input-area");
 const fileInput = $("#video-file");
+const decodeMethodEl = $("#decode-method");
 const progressContainer = $("#progress-bar-container");
 const progressBar = $("#progress-bar");
 const resultsEl = $("#results");
@@ -23,10 +25,10 @@ const scoreEl = $("#score");
 const timingEl = $("#timing");
 const frameScoresHeadEl = $("#frame-scores-head");
 const frameScoresEl = $("#frame-scores");
-const videoEl = $("#video-el");
 
 function setStatus(msg) { statusEl.textContent = msg; }
 function showError(msg) { errorEl.textContent = msg; errorEl.style.display = "block"; }
+function clearError() { errorEl.style.display = "none"; }
 
 const MODEL_PATHS = [
   "models/content_net.onnx",
@@ -41,8 +43,24 @@ async function loadBackend(name, { warmup = true } = {}) {
   return uvq;
 }
 
+function createDecoder(method) {
+  return method === "webcodecs" ? new WebCodecsDecoder() : new VideoElementDecoder();
+}
+
+function getDecoderLabel(method) {
+  return method === "webcodecs" ? "WebCodecs" : "<video> element";
+}
+
 async function init() {
   const backends = {}; // { name: UVQ instance }
+
+  // Disable WebCodecs option if not supported
+  const hasWebCodecs = typeof VideoDecoder !== "undefined";
+  if (!hasWebCodecs) {
+    const wcOption = decodeMethodEl.querySelector('option[value="webcodecs"]');
+    wcOption.disabled = true;
+    wcOption.textContent += " (not supported)";
+  }
 
   // WebGPU requires a secure context (HTTPS or localhost)
   const hasWebGPU = window.isSecureContext && !!navigator.gpu;
@@ -89,45 +107,54 @@ async function init() {
   fileInput.addEventListener("change", async () => {
     const file = fileInput.files[0];
     if (!file) return;
+    clearError();
+
+    const method = decodeMethodEl.value;
+
+    // WebCodecs only supports MP4/MOV containers (mp4box.js limitation)
+    if (method === "webcodecs") {
+      const ext = file.name.split(".").pop().toLowerCase();
+      if (!["mp4", "m4v", "mov"].includes(ext)) {
+        showError("WebCodecs decoder requires MP4/MOV files. Select a different file or switch to <video> element decode.");
+        return;
+      }
+    }
+
     if (compareMode) {
-      await processVideoCompare(backends.webgpu, backends.wasm, file);
+      await processVideoCompare(backends.webgpu, backends.wasm, file, method);
     } else {
-      await processVideoSingle(backends[names[0]], names[0], file);
+      await processVideoSingle(backends[names[0]], names[0], file, method);
     }
   });
 }
 
-async function decodeFrame(videoEl, ctx, t) {
-  videoEl.currentTime = t + 0.5;
-  await new Promise((resolve) => { videoEl.onseeked = resolve; });
-  ctx.drawImage(videoEl, 0, 0);
-}
-
-async function processVideoCompare(uvqGpu, uvqWasm, file) {
+async function processVideoCompare(uvqGpu, uvqWasm, file, method) {
   resultsEl.style.display = "none";
   progressContainer.style.display = "block";
   progressBar.value = 0;
   frameScoresEl.innerHTML = "";
 
-  const url = URL.createObjectURL(file);
-  videoEl.src = url;
-
-  await new Promise((resolve, reject) => {
-    videoEl.onloadedmetadata = resolve;
-    videoEl.onerror = () => reject(new Error("Failed to load video"));
-  });
-
-  const duration = Math.floor(videoEl.duration);
-  if (duration < 1) {
-    showError("Video is shorter than 1 second.");
+  const decoder = createDecoder(method);
+  const decoderLabel = getDecoderLabel(method);
+  let info;
+  try {
+    setStatus(`Initializing decoder (${decoderLabel})...`);
+    info = await decoder.init(file);
+  } catch (e) {
+    showError(`Decoder init failed: ${e.message}`);
     progressContainer.style.display = "none";
     return;
   }
 
-  setStatus(`Processing ${duration} frame(s) on both backends...`);
+  const { duration } = info;
+  if (duration < 1) {
+    showError("Video is shorter than 1 second.");
+    decoder.dispose();
+    progressContainer.style.display = "none";
+    return;
+  }
 
-  const canvas = new OffscreenCanvas(videoEl.videoWidth, videoEl.videoHeight);
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  setStatus(`Processing ${duration} frame(s) on both backends (${decoderLabel})...`);
 
   const frames = [];
   const t0 = performance.now();
@@ -135,7 +162,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   for (let t = 0; t < duration; t++) {
     // Decode once
     const decodeStart = performance.now();
-    await decodeFrame(videoEl, ctx, t);
+    const canvas = await decoder.decodeFrame(t);
     const { content, patches } = preprocessFrame(canvas);
     const decodeTime = performance.now() - decodeStart;
 
@@ -156,7 +183,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   }
 
   const elapsed = performance.now() - t0;
-  URL.revokeObjectURL(url);
+  decoder.dispose();
 
   // Display results
   const avgGpu = frames.reduce((a, f) => a + f.gpuScore, 0) / frames.length;
@@ -167,6 +194,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   scoreEl.textContent = avgGpu.toFixed(3);
   timingEl.textContent =
     `${duration} frames in ${(elapsed / 1000).toFixed(1)}s — ` +
+    `decode: ${decoderLabel} (init: ${(decoder.initTime / 1000).toFixed(2)}s), ` +
     `WebGPU total: ${(totalGpuInfer / 1000).toFixed(1)}s, ` +
     `WASM total: ${(totalWasmInfer / 1000).toFixed(1)}s, ` +
     `speedup: ${speedup.toFixed(1)}x`;
@@ -192,38 +220,40 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   setStatus("Done.");
 }
 
-async function processVideoSingle(uvq, backendName, file) {
+async function processVideoSingle(uvq, backendName, file, method) {
   resultsEl.style.display = "none";
   progressContainer.style.display = "block";
   progressBar.value = 0;
   frameScoresEl.innerHTML = "";
 
-  const url = URL.createObjectURL(file);
-  videoEl.src = url;
-
-  await new Promise((resolve, reject) => {
-    videoEl.onloadedmetadata = resolve;
-    videoEl.onerror = () => reject(new Error("Failed to load video"));
-  });
-
-  const duration = Math.floor(videoEl.duration);
-  if (duration < 1) {
-    showError("Video is shorter than 1 second.");
+  const decoder = createDecoder(method);
+  const decoderLabel = getDecoderLabel(method);
+  let info;
+  try {
+    setStatus(`Initializing decoder (${decoderLabel})...`);
+    info = await decoder.init(file);
+  } catch (e) {
+    showError(`Decoder init failed: ${e.message}`);
     progressContainer.style.display = "none";
     return;
   }
 
-  setStatus(`Processing ${duration} frame(s) (${backendName})...`);
+  const { duration } = info;
+  if (duration < 1) {
+    showError("Video is shorter than 1 second.");
+    decoder.dispose();
+    progressContainer.style.display = "none";
+    return;
+  }
 
-  const canvas = new OffscreenCanvas(videoEl.videoWidth, videoEl.videoHeight);
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  setStatus(`Processing ${duration} frame(s) (${backendName}, ${decoderLabel})...`);
 
   const frames = [];
   const t0 = performance.now();
 
   for (let t = 0; t < duration; t++) {
     const decodeStart = performance.now();
-    await decodeFrame(videoEl, ctx, t);
+    const canvas = await decoder.decodeFrame(t);
     const { content, patches } = preprocessFrame(canvas);
     const decodeTime = performance.now() - decodeStart;
 
@@ -238,11 +268,14 @@ async function processVideoSingle(uvq, backendName, file) {
   }
 
   const elapsed = performance.now() - t0;
-  URL.revokeObjectURL(url);
+  decoder.dispose();
 
   const avgScore = frames.reduce((a, f) => a + f.score, 0) / frames.length;
   scoreEl.textContent = avgScore.toFixed(3);
-  timingEl.textContent = `${duration} frames in ${(elapsed / 1000).toFixed(1)}s (${(elapsed / duration).toFixed(0)} ms/frame, ${backendName})`;
+  timingEl.textContent =
+    `${duration} frames in ${(elapsed / 1000).toFixed(1)}s ` +
+    `(${(elapsed / duration).toFixed(0)} ms/frame, ${backendName}, ` +
+    `decode: ${decoderLabel}, init: ${(decoder.initTime / 1000).toFixed(2)}s)`;
 
   frameScoresHeadEl.innerHTML = `<tr><th>Second</th><th>Score</th><th>Decode time</th><th>Inference time</th></tr>`;
   frameScoresEl.innerHTML = frames
