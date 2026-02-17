@@ -23,6 +23,16 @@ Benchmark numbers for UVQ inference pipelines on a single workstation.
 | Storage | NVMe SSD |
 | OS | macOS 26.3, Python 3.12 |
 
+### Rockchip RK3588S (Orange Pi 5 Plus)
+
+| Component | Spec |
+|-----------|------|
+| SoC | Rockchip RK3588S (4x A76 + 4x A55, 6 TOPS NPU) |
+| RAM | 16 GB LPDDR4X |
+| Storage | NVMe SSD |
+| OS | Ubuntu 22.04, BSP kernel 6.1.43, Python 3.10 |
+| NPU | RKNPU2 driver 0.9.6, librknnrt 2.3.2 |
+
 ## Test Video
 
 All benchmarks use the same 20-second 720p gaming clip (`Gaming_720P-25aa_orig.mp4`, 1280x720, 30 fps, ~11 MB) from the YouTube-UGC dataset. 1080p benchmarks use `Gaming_1080P-0ef8_orig.mp4` (1920x1080, ~80 MB).
@@ -194,6 +204,24 @@ Video decode via WebCodecs batch decoding takes 0.19 s for all 20 frames. The `<
 
 Score differs from PyTorch/MLX (3.034) by ~0.06, likely due to differences in video decode and resize between the `<video>` element and FFmpeg.
 
+## UVQ 1.5 -- RKNN NPU (Orange Pi 5 Plus / RK3588S)
+
+Hybrid pipeline: content and distortion nets on NPU (FP16), aggregation net on CPU via ONNX Runtime (FP32). The aggregation net cannot run on the NPU due to FP16 overflow in its Conv2d layer (output abs_max=87,365 exceeds FP16 max=65,504). See `RESEARCH.md` for details.
+
+Input: synthetic random tensors matching real pipeline shapes, single-frame inference (20 frames).
+
+| Stage | Mean (ms) | Median (ms) |
+|-------|-----------|-------------|
+| model_loading | 321 | — |
+| content_net (NPU) | 28.1 | 28.4 |
+| distortion_net (NPU, 9 patches) | 956.9 | 891.4 |
+| aggregation_net (CPU/ONNX) | 2.9 | 3.0 |
+| **total_pipeline** | **987.9** | **921.5** |
+
+Average throughput: **1.0 fps**
+
+The distortion net dominates at 97% of pipeline time, processing 9 patches sequentially through the NPU (each patch is 360x640 through EfficientNet-B0). Content net and aggregation net are negligible at ~28ms and ~3ms respectively. The two NPU models run on separate NPU cores (CORE_0 and CORE_1).
+
 ## Comparison
 
 ### UVQ 1.5 vs UVQ 1.0 (CPU, 720p)
@@ -232,6 +260,20 @@ End-to-end GPU speedup is 5.8x (32.3s → 5.6s) rather than 18.2x because video 
 
 MLX and WebGPU both use the M4 GPU but through different frameworks: MLX runs via Metal from Python, while ONNX Runtime Web uses Dawn/Metal from Chrome's WebGPU API. The WASM backend runs on CPU via onnxruntime-web's WebAssembly SIMD backend. ONNX Runtime's graph-level optimizations (operator fusion, memory planning) account for much of the speedup over MLX.
 
+### UVQ 1.5 -- All backends, per-frame inference
+
+| Backend | Hardware | Per-frame (ms) | Relative |
+|---------|----------|---------------|----------|
+| PyTorch GPU | GTX 980 Ti | 78 | **18.2x faster** |
+| Browser WebGPU | M4 GPU | 310 | 4.6x faster |
+| Browser WASM | M4 CPU | 580 | 2.4x faster |
+| ONNX Node.js CPU | i7-6700K | 726 | 2.0x faster |
+| RKNN NPU (hybrid) | RK3588S NPU | 922 | 1.5x faster |
+| MLX | M4 GPU | 965 | 1.5x faster |
+| PyTorch CPU | i7-6700K | 1,420 | 1.0x |
+
+Note: different hardware platforms; numbers are not directly comparable across machines. The relative column uses PyTorch CPU on x86 as baseline for orientation only.
+
 ## Key Observations
 
 1. **CPU bottleneck is model inference.** The forward pass accounts for 88% (UVQ 1.5) and 93% (UVQ 1.0, combined subnets) of CPU pipeline time.
@@ -249,6 +291,10 @@ MLX and WebGPU both use the M4 GPU but through different frameworks: MLX runs vi
 7. **ONNX Runtime is faster per-frame than PyTorch CPU.** Graph-level optimizations in ONNX Runtime reduce single-frame inference to ~0.73s vs ~1.42s per frame in PyTorch on x86. On Apple Silicon, the same ONNX models via the browser WebGPU backend achieve 310 ms/frame — 3.1x faster than MLX and 4.6x faster than PyTorch CPU on x86.
 
 8. **WebGPU shader compilation adds first-frame overhead.** The WebGPU backend's first inference takes ~680 ms (vs steady-state 278 ms) due to WGSL compute shader compilation. Warmup is skipped due to an onnxruntime-web buffer lifecycle bug. Performance stabilizes by frame 3.
+
+9. **RKNN NPU is bottlenecked by sequential patch processing.** The distortion net processes 9 patches sequentially (each ~100ms), accounting for 97% of per-frame time. The content net (28ms) and aggregation net (3ms) are negligible. Batched patch inference or multi-core NPU parallelism could reduce this significantly.
+
+10. **RKNN aggregation net requires CPU fallback.** The aggregation net's Conv2d(256→256, 1×1) produces values exceeding FP16 range (abs_max=87,365 vs FP16 max=65,504), causing silent corruption on the NPU. Running it on CPU via ONNX Runtime (~3ms) is the correct solution since the cost is negligible.
 
 ## Reproducing
 
@@ -272,4 +318,9 @@ cd uvq1p5_web && npm install && npm test
 # Browser WebGPU/WASM benchmarks (Chrome, secure context required)
 cd uvq1p5_web && npm run dev
 # Open https://localhost:5173 in Chrome, load a video file
+
+# RKNN NPU benchmarks (Orange Pi 5 Plus / RK3588S with BSP kernel)
+# Requires: rknn-toolkit-lite2, onnxruntime, .rknn model files
+scp scripts/benchmark_rknn.py orangepi@board:~/uvq/
+ssh orangepi@board 'python3 ~/uvq/benchmark_rknn.py'
 ```
