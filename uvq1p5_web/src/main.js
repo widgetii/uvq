@@ -45,8 +45,9 @@ async function loadBackend(name, { warmup = true } = {}) {
 /**
  * Initialize both decoders. VideoElementDecoder always works;
  * WebCodecsDecoder is best-effort (MP4 only, WebCodecs-capable browsers).
+ * Shows progress bar during WebCodecs batch decode.
  */
-async function initDecoders(file) {
+async function initDecoders(file, { setStatus, progressBar, progressContainer }) {
   const vidDecoder = new VideoElementDecoder();
   const info = await vidDecoder.init(file);
 
@@ -56,7 +57,12 @@ async function initDecoders(file) {
     if (["mp4", "m4v", "mov"].includes(ext)) {
       try {
         wcDecoder = new WebCodecsDecoder();
-        await wcDecoder.init(file);
+        setStatus("Decoding video with WebCodecs...");
+        progressContainer.style.display = "block";
+        progressBar.value = 0;
+        await wcDecoder.init(file, {
+          onProgress: (p) => { progressBar.value = p * 100; },
+        });
       } catch (e) {
         console.warn("WebCodecs decoder init failed:", e.message);
         wcDecoder = null;
@@ -65,26 +71,6 @@ async function initDecoders(file) {
   }
 
   return { vidDecoder, wcDecoder, info };
-}
-
-const DECODE_REPS = 3;
-
-function median(arr) {
-  const sorted = [...arr].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-/** Decode frame t with decoder `reps` times, return { canvas, time: median ms }. */
-async function benchDecode(decoder, t, reps) {
-  const times = [];
-  let canvas;
-  for (let r = 0; r < reps; r++) {
-    const start = performance.now();
-    canvas = await decoder.decodeFrame(t);
-    times.push(performance.now() - start);
-  }
-  return { canvas, time: median(times) };
 }
 
 async function init() {
@@ -154,7 +140,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   let vidDecoder, wcDecoder, info;
   try {
     setStatus("Initializing decoders...");
-    ({ vidDecoder, wcDecoder, info } = await initDecoders(file));
+    ({ vidDecoder, wcDecoder, info } = await initDecoders(file, { setStatus, progressBar, progressContainer }));
   } catch (e) {
     showError(`Decoder init failed: ${e.message}`);
     progressContainer.style.display = "none";
@@ -170,27 +156,16 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
     return;
   }
 
-  // Warmup: decode frame 0 with both decoders (untimed) to prime pipelines
-  setStatus("Warming up decoders...");
-  await vidDecoder.decodeFrame(0);
-  if (wcDecoder) await wcDecoder.decodeFrame(0);
-
   setStatus(`Processing ${duration} frame(s) on both backends...`);
+  progressContainer.style.display = "block";
+  progressBar.value = 0;
 
   const frames = [];
   const t0 = performance.now();
 
   for (let t = 0; t < duration; t++) {
-    // Decode with <video> element (median of DECODE_REPS runs)
-    const { canvas: vidCanvas, time: vidTime } = await benchDecode(vidDecoder, t, DECODE_REPS);
-
-    // Decode with WebCodecs (median of DECODE_REPS runs, if available)
-    let wcTime = null;
-    if (wcDecoder) {
-      ({ time: wcTime } = await benchDecode(wcDecoder, t, DECODE_REPS));
-    }
-
-    const { content, patches } = preprocessFrame(vidCanvas);
+    const canvas = await vidDecoder.decodeFrame(t);
+    const { content, patches } = preprocessFrame(canvas);
 
     // Infer WebGPU
     const gpuStart = performance.now();
@@ -202,7 +177,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
     const wasmScore = await uvqWasm.infer(content, patches);
     const wasmTime = performance.now() - wasmStart;
 
-    frames.push({ gpuScore, wasmScore, vidTime, wcTime, gpuTime, wasmTime });
+    frames.push({ gpuScore, wasmScore, gpuTime, wasmTime });
 
     progressBar.value = ((t + 1) / duration) * 100;
     setStatus(`Processing frame ${t + 1} / ${duration}...`);
@@ -214,37 +189,28 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
 
   // Display results
   const avgGpu = frames.reduce((a, f) => a + f.gpuScore, 0) / frames.length;
-  const totalVidDecode = frames.reduce((a, f) => a + f.vidTime, 0);
-  const totalWcDecode = wcDecoder ? frames.reduce((a, f) => a + f.wcTime, 0) : null;
   const totalGpuInfer = frames.reduce((a, f) => a + f.gpuTime, 0);
   const totalWasmInfer = frames.reduce((a, f) => a + f.wasmTime, 0);
   const inferSpeedup = totalWasmInfer / totalGpuInfer;
 
   scoreEl.textContent = avgGpu.toFixed(3);
-  let timing =
-    `${duration} frames in ${(elapsed / 1000).toFixed(1)}s — ` +
-    `decode (median of ${DECODE_REPS}): <video> ${(totalVidDecode / 1000).toFixed(2)}s`;
-  if (totalWcDecode != null) {
-    const decodeSpeedup = totalVidDecode / totalWcDecode;
-    timing += `, WebCodecs ${(totalWcDecode / 1000).toFixed(2)}s (${decodeSpeedup.toFixed(1)}x)`;
+  let timing = `${duration} frames in ${(elapsed / 1000).toFixed(1)}s`;
+  if (wcDecoder) {
+    timing += ` — WebCodecs decode: ${(wcDecoder.decodeTime / 1000).toFixed(2)}s (batch)`;
   }
   timing +=
     ` | WebGPU infer: ${(totalGpuInfer / 1000).toFixed(1)}s, ` +
     `WASM infer: ${(totalWasmInfer / 1000).toFixed(1)}s (${inferSpeedup.toFixed(1)}x)`;
   timingEl.textContent = timing;
 
-  const wcHead = wcDecoder ? `<th>Decode (WebCodecs)</th>` : "";
-  frameScoresHeadEl.innerHTML = `<tr><th>Second</th><th>Score (WebGPU)</th><th>Score (WASM)</th><th>Decode (&lt;video&gt;)</th>${wcHead}<th>Infer (WebGPU)</th><th>Infer (WASM)</th><th>Speedup</th></tr>`;
+  frameScoresHeadEl.innerHTML = `<tr><th>Second</th><th>Score (WebGPU)</th><th>Score (WASM)</th><th>Infer (WebGPU)</th><th>Infer (WASM)</th><th>Speedup</th></tr>`;
   frameScoresEl.innerHTML = frames
     .map((f, i) => {
       const sp = f.wasmTime / f.gpuTime;
-      const wcCol = wcDecoder ? `<td>${f.wcTime.toFixed(0)} ms</td>` : "";
       return `<tr>` +
         `<td>${i}</td>` +
         `<td>${f.gpuScore.toFixed(4)}</td>` +
         `<td>${f.wasmScore.toFixed(4)}</td>` +
-        `<td>${f.vidTime.toFixed(0)} ms</td>` +
-        wcCol +
         `<td>${f.gpuTime.toFixed(0)} ms</td>` +
         `<td>${f.wasmTime.toFixed(0)} ms</td>` +
         `<td>${sp.toFixed(1)}x</td>` +
@@ -266,7 +232,7 @@ async function processVideoSingle(uvq, backendName, file) {
   let vidDecoder, wcDecoder, info;
   try {
     setStatus("Initializing decoders...");
-    ({ vidDecoder, wcDecoder, info } = await initDecoders(file));
+    ({ vidDecoder, wcDecoder, info } = await initDecoders(file, { setStatus, progressBar, progressContainer }));
   } catch (e) {
     showError(`Decoder init failed: ${e.message}`);
     progressContainer.style.display = "none";
@@ -282,32 +248,22 @@ async function processVideoSingle(uvq, backendName, file) {
     return;
   }
 
-  // Warmup: decode frame 0 with both decoders (untimed) to prime pipelines
-  setStatus("Warming up decoders...");
-  await vidDecoder.decodeFrame(0);
-  if (wcDecoder) await wcDecoder.decodeFrame(0);
-
   setStatus(`Processing ${duration} frame(s) (${backendName})...`);
+  progressContainer.style.display = "block";
+  progressBar.value = 0;
 
   const frames = [];
   const t0 = performance.now();
 
   for (let t = 0; t < duration; t++) {
-    // Decode with <video> element (median of DECODE_REPS runs)
-    const { canvas: vidCanvas, time: vidTime } = await benchDecode(vidDecoder, t, DECODE_REPS);
-
-    // Decode with WebCodecs (median of DECODE_REPS runs, if available)
-    let wcTime = null;
-    if (wcDecoder) {
-      ({ time: wcTime } = await benchDecode(wcDecoder, t, DECODE_REPS));
-    }
+    const canvas = await vidDecoder.decodeFrame(t);
 
     const inferStart = performance.now();
-    const { content, patches } = preprocessFrame(vidCanvas);
+    const { content, patches } = preprocessFrame(canvas);
     const score = await uvq.infer(content, patches);
     const inferTime = performance.now() - inferStart;
 
-    frames.push({ score, vidTime, wcTime, inferTime });
+    frames.push({ score, inferTime });
 
     progressBar.value = ((t + 1) / duration) * 100;
     setStatus(`Processing frame ${t + 1} / ${duration}...`);
@@ -318,27 +274,19 @@ async function processVideoSingle(uvq, backendName, file) {
   if (wcDecoder) wcDecoder.dispose();
 
   const avgScore = frames.reduce((a, f) => a + f.score, 0) / frames.length;
-  const totalVidDecode = frames.reduce((a, f) => a + f.vidTime, 0);
-  const totalWcDecode = wcDecoder ? frames.reduce((a, f) => a + f.wcTime, 0) : null;
 
   scoreEl.textContent = avgScore.toFixed(3);
   let timing =
     `${duration} frames in ${(elapsed / 1000).toFixed(1)}s ` +
-    `(${(elapsed / duration).toFixed(0)} ms/frame, ${backendName}) — ` +
-    `decode (median of ${DECODE_REPS}): <video> ${(totalVidDecode / 1000).toFixed(2)}s`;
-  if (totalWcDecode != null) {
-    const decodeSpeedup = totalVidDecode / totalWcDecode;
-    timing += `, WebCodecs ${(totalWcDecode / 1000).toFixed(2)}s (${decodeSpeedup.toFixed(1)}x)`;
+    `(${(elapsed / duration).toFixed(0)} ms/frame, ${backendName})`;
+  if (wcDecoder) {
+    timing += ` — WebCodecs decode: ${(wcDecoder.decodeTime / 1000).toFixed(2)}s (batch)`;
   }
   timingEl.textContent = timing;
 
-  const wcHead = wcDecoder ? `<th>Decode (WebCodecs)</th>` : "";
-  frameScoresHeadEl.innerHTML = `<tr><th>Second</th><th>Score</th><th>Decode (&lt;video&gt;)</th>${wcHead}<th>Inference</th></tr>`;
+  frameScoresHeadEl.innerHTML = `<tr><th>Second</th><th>Score</th><th>Inference</th></tr>`;
   frameScoresEl.innerHTML = frames
-    .map((f, i) => {
-      const wcCol = wcDecoder ? `<td>${f.wcTime.toFixed(0)} ms</td>` : "";
-      return `<tr><td>${i}</td><td>${f.score.toFixed(4)}</td><td>${f.vidTime.toFixed(0)} ms</td>${wcCol}<td>${f.inferTime.toFixed(0)} ms</td></tr>`;
-    })
+    .map((f, i) => `<tr><td>${i}</td><td>${f.score.toFixed(4)}</td><td>${f.inferTime.toFixed(0)} ms</td></tr>`)
     .join("");
 
   resultsEl.style.display = "block";

@@ -68,31 +68,52 @@ export class VideoElementDecoder {
 
 export class WebCodecsDecoder {
   constructor() {
-    // _samples: array in decode order (DTS), each with { cts, dts, duration, is_sync, data }
-    this._samples = null;
-    // _ctsSorted: array of { cts, sampleIdx } sorted by cts for presentation-time lookup
-    this._ctsSorted = null;
     this._config = null;    // VideoDecoderConfig
     this._canvas = null;
     this._ctx = null;
-    this.initTime = 0;
+    this._frameCache = null; // Map<second, OffscreenCanvas> — pre-decoded frames
+    this.initTime = 0;       // total init (demux + decode)
+    this.demuxTime = 0;      // demux only
+    this.decodeTime = 0;     // batch decode only
   }
 
-  async init(file) {
+  /**
+   * @param {File} file
+   * @param {object} [opts]
+   * @param {function(number):void} [opts.onProgress] - called with 0..1 during batch decode
+   */
+  async init(file, opts) {
+    const onProgress = opts?.onProgress;
     const t0 = performance.now();
     const buffer = await file.arrayBuffer();
 
+    const demuxStart = performance.now();
     const { config, samples, width, height, duration } = await this._demux(buffer);
+    this.demuxTime = performance.now() - demuxStart;
     this._config = config;
-    this._samples = samples;
-
-    // Build CTS-sorted index for presentation-time seeking
-    this._ctsSorted = samples
-      .map((s, i) => ({ cts: s.cts, sampleIdx: i }))
-      .sort((a, b) => a.cts - b.cts);
 
     this._canvas = new OffscreenCanvas(width, height);
     this._ctx = this._canvas.getContext("2d", { willReadFrequently: true });
+
+    // Build CTS-sorted index for target-frame lookup
+    const ctsSorted = samples
+      .map((s, i) => ({ cts: s.cts, sampleIdx: i }))
+      .sort((a, b) => a.cts - b.cts);
+
+    // Determine target CTS values (one per second at t+0.5)
+    const targetCtsSet = new Set();
+    for (let t = 0; t < duration; t++) {
+      const targetUs = (t + 0.5) * 1e6;
+      const idx = bsearchCts(ctsSorted, targetUs);
+      targetCtsSet.add(samples[ctsSorted[idx].sampleIdx].cts);
+    }
+
+    // Single-pass batch decode: feed all samples, capture target frames
+    const decodeStart = performance.now();
+    this._frameCache = await this._batchDecode(
+      samples, targetCtsSet, duration, ctsSorted, width, height, onProgress,
+    );
+    this.decodeTime = performance.now() - decodeStart;
 
     this.initTime = performance.now() - t0;
     return { width, height, duration };
@@ -175,114 +196,117 @@ export class WebCodecsDecoder {
     });
   }
 
-  async decodeFrame(t) {
-    const targetUs = (t + 0.5) * 1e6; // target timestamp in microseconds
-
-    // Find sample with closest CTS (presentation time) to target
-    const targetIdx = this._findByCts(targetUs);
-
-    // Walk back in decode order to nearest sync (keyframe)
-    let syncIdx = targetIdx;
-    while (syncIdx > 0 && !this._samples[syncIdx].is_sync) {
-      syncIdx--;
-    }
-
-    // Decode from keyframe through target, pick frame closest to target CTS
-    const targetCts = this._samples[targetIdx].cts;
-    const frame = await this._decodeRange(syncIdx, targetIdx, targetCts);
-    this._ctx.drawImage(frame, 0, 0);
-    frame.close();
-
-    return this._canvas;
-  }
-
   /**
-   * Find the sample index (in decode-order array) whose CTS is closest to targetUs.
-   * Uses the CTS-sorted index for binary search, then maps back to decode-order index.
+   * Single-pass batch decode: feed all samples through one VideoDecoder,
+   * capture the frame closest to each target CTS, store as OffscreenCanvas.
    */
-  _findByCts(targetUs) {
-    const sorted = this._ctsSorted;
-    let lo = 0, hi = sorted.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (sorted[mid].cts < targetUs) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
+  async _batchDecode(samples, targetCtsSet, duration, ctsSorted, width, height, onProgress) {
+    // Map target CTS -> second index for fast lookup
+    const ctsToSecond = new Map();
+    for (let t = 0; t < duration; t++) {
+      const targetUs = (t + 0.5) * 1e6;
+      const idx = bsearchCts(ctsSorted, targetUs);
+      const cts = samples[ctsSorted[idx].sampleIdx].cts;
+      ctsToSecond.set(cts, t);
     }
-    // lo is the first entry >= targetUs; check if lo-1 is closer
-    if (lo > 0) {
-      const diffLo = Math.abs(sorted[lo].cts - targetUs);
-      const diffPrev = Math.abs(sorted[lo - 1].cts - targetUs);
-      if (diffPrev < diffLo) lo = lo - 1;
-    }
-    return sorted[lo].sampleIdx;
-  }
 
-  /**
-   * Create a fresh VideoDecoder, feed samples syncIdx..targetIdx in decode order,
-   * flush, collect all output frames, and return the one closest to targetCts.
-   */
-  _decodeRange(syncIdx, targetIdx, targetCts) {
+    const cache = new Map();   // second -> OffscreenCanvas
+    const pending = new Map(); // cts -> { second, canvas }
+
+    for (const [cts, t] of ctsToSecond) {
+      pending.set(cts, { second: t, canvas: null });
+    }
+
     return new Promise((resolve, reject) => {
-      const frames = [];
+      let samplesQueued = 0;
+      const totalSamples = samples.length;
 
       const decoder = new VideoDecoder({
-        output: (frame) => { frames.push(frame); },
-        error: (e) => {
-          // Close any already-collected frames to avoid GC warnings
-          for (const f of frames) f.close();
-          frames.length = 0;
-          reject(new Error(`VideoDecoder error: ${e.message}`));
+        output: (frame) => {
+          for (const [cts, entry] of pending) {
+            const diff = Math.abs(frame.timestamp - cts);
+            if (diff < 500_000) {
+              if (!entry.canvas) {
+                entry.canvas = new OffscreenCanvas(width, height);
+              }
+              entry.canvas.getContext("2d").drawImage(frame, 0, 0);
+            }
+          }
+          frame.close();
         },
+        error: (e) => reject(new Error(`VideoDecoder error: ${e.message}`)),
       });
 
       decoder.configure(this._config);
 
-      for (let i = syncIdx; i <= targetIdx; i++) {
-        const s = this._samples[i];
-        decoder.decode(new EncodedVideoChunk({
-          type: s.is_sync ? "key" : "delta",
-          timestamp: s.cts,
-          duration: s.duration,
-          data: s.data,
-        }));
-      }
+      // Feed samples in batches, yielding to the event loop for UI updates
+      const BATCH_SIZE = 64;
+      const feedBatch = () => {
+        const end = Math.min(samplesQueued + BATCH_SIZE, totalSamples);
+        for (let i = samplesQueued; i < end; i++) {
+          const s = samples[i];
+          decoder.decode(new EncodedVideoChunk({
+            type: s.is_sync ? "key" : "delta",
+            timestamp: s.cts,
+            duration: s.duration,
+            data: s.data,
+          }));
+        }
+        samplesQueued = end;
+        if (onProgress) onProgress(samplesQueued / totalSamples);
 
-      decoder.flush().then(() => {
-        decoder.close();
-        if (frames.length === 0) {
-          reject(new Error("No frame decoded"));
-          return;
+        if (samplesQueued < totalSamples) {
+          setTimeout(feedBatch, 0);
+        } else {
+          decoder.flush().then(() => {
+            decoder.close();
+            for (const [, entry] of pending) {
+              if (entry.canvas) {
+                cache.set(entry.second, entry.canvas);
+              }
+            }
+            resolve(cache);
+          }).catch(reject);
         }
-        // Pick the frame whose timestamp is closest to targetCts
-        let best = 0;
-        let bestDiff = Math.abs(frames[0].timestamp - targetCts);
-        for (let i = 1; i < frames.length; i++) {
-          const diff = Math.abs(frames[i].timestamp - targetCts);
-          if (diff < bestDiff) {
-            bestDiff = diff;
-            best = i;
-          }
-        }
-        // Close all frames except the best one
-        for (let i = 0; i < frames.length; i++) {
-          if (i !== best) frames[i].close();
-        }
-        resolve(frames[best]);
-      }).catch((e) => {
-        for (const f of frames) f.close();
-        reject(e);
-      });
+      };
+      feedBatch();
     });
   }
 
+  async decodeFrame(t) {
+    const cached = this._frameCache.get(t);
+    if (cached) {
+      this._ctx.drawImage(cached, 0, 0);
+    }
+    return this._canvas;
+  }
+
   dispose() {
-    this._samples = null;
-    this._ctsSorted = null;
+    this._frameCache = null;
     this._config = null;
     this._canvas = null;
     this._ctx = null;
   }
+}
+
+/**
+ * Binary search on a CTS-sorted index array for the entry closest to targetUs.
+ * Returns the index into the sorted array.
+ */
+function bsearchCts(sorted, targetUs) {
+  let lo = 0, hi = sorted.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid].cts < targetUs) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo > 0) {
+    const diffLo = Math.abs(sorted[lo].cts - targetUs);
+    const diffPrev = Math.abs(sorted[lo - 1].cts - targetUs);
+    if (diffPrev < diffLo) lo = lo - 1;
+  }
+  return lo;
 }
