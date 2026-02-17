@@ -34,10 +34,10 @@ const MODEL_PATHS = [
   "models/aggregation_net.onnx",
 ];
 
-async function loadBackend(name) {
+async function loadBackend(name, { warmup = true } = {}) {
   const uvq = new UVQ(ort);
   await uvq.load(...MODEL_PATHS, { executionProviders: [name] });
-  await uvq.warmup();
+  if (warmup) await uvq.warmup();
   return uvq;
 }
 
@@ -54,11 +54,11 @@ async function init() {
     }
   }
 
-  // Load WebGPU backend
+  // Load WebGPU backend (skip warmup — first real inference compiles pipelines)
   if (hasWebGPU) {
     setStatus("Loading models (webgpu backend)...");
     try {
-      backends.webgpu = await loadBackend("webgpu");
+      backends.webgpu = await loadBackend("webgpu", { warmup: false });
     } catch (e) {
       console.warn("WebGPU backend failed:", e);
     }
@@ -77,6 +77,11 @@ async function init() {
   }
 
   const names = Object.keys(backends);
+  if (names.length === 0) {
+    showError("No backend available.");
+    setStatus("Model loading failed.");
+    return;
+  }
   const compareMode = names.length === 2;
   setStatus(`Ready (${names.join(" + ")}). Select a video file to assess.`);
   fileArea.style.display = "block";
@@ -122,7 +127,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   setStatus(`Processing ${duration} frame(s) on both backends...`);
 
   const canvas = new OffscreenCanvas(videoEl.videoWidth, videoEl.videoHeight);
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
   const frames = [];
   const t0 = performance.now();
@@ -211,7 +216,7 @@ async function processVideoSingle(uvq, backendName, file) {
   setStatus(`Processing ${duration} frame(s) (${backendName})...`);
 
   const canvas = new OffscreenCanvas(videoEl.videoWidth, videoEl.videoHeight);
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
   const frames = [];
   const t0 = performance.now();

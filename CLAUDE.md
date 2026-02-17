@@ -75,6 +75,12 @@ Both model versions have `custom_nn_layers.py` modules that emulate TensorFlow's
 
 `uvq1p5_web/` — Browser-based inference using ONNX Runtime Web with WebGPU. Models are exported from PyTorch via `scripts/export_onnx.py` to three ONNX files (content_net, distortion_net, aggregation_net) stored in `uvq1p5_web/public/models/`. The `uvq1p5_web/src/uvq.js` engine is framework-agnostic and works with both `onnxruntime-web` (browser) and `onnxruntime-node` (Node.js CLI testing).
 
+**WebGPU constraints in onnxruntime-web:**
+- Pin `onnxruntime-web` to **1.21.x**. Versions >=1.22 introduce aggressive GPU buffer destruction that causes "Buffer used in submit while destroyed" errors with multiple sessions on a shared WebGPU device. The `onnxruntime-web/webgpu` subpath doesn't exist in <=1.20.
+- WebGPU sessions must be created **sequentially** (no `Promise.all`); the EP rejects concurrent session creation.
+- **Skip warmup** for the WebGPU backend — dummy inference triggers the same buffer errors. The first real inference compiles shader pipelines on demand.
+- Always **dispose output tensors** after reading their `.data` to release GPU buffers (see `uvq.js` methods). Leaking output tensors causes stale buffer references.
+
 ### Pre-trained Weights
 
 Checkpoints are committed directly in `uvq1p5_pytorch/checkpoints/` and `uvq_pytorch/checkpoint/`. The `models/` directory contains TensorFlow baseline models (not used by the PyTorch inference code). ONNX models in `uvq1p5_web/public/models/` are generated (not committed) — run `scripts/export_onnx.py` to create them.

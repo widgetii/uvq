@@ -32,14 +32,10 @@ export class UVQ {
    */
   async load(contentPath, distortionPath, aggPath, options) {
     const opts = options || {};
-    const [c, d, a] = await Promise.all([
-      this.ort.InferenceSession.create(contentPath, opts),
-      this.ort.InferenceSession.create(distortionPath, opts),
-      this.ort.InferenceSession.create(aggPath, opts),
-    ]);
-    this.contentSession = c;
-    this.distortionSession = d;
-    this.aggSession = a;
+    // Create sessions sequentially — WebGPU EP does not support concurrent creation.
+    this.contentSession = await this.ort.InferenceSession.create(contentPath, opts);
+    this.distortionSession = await this.ort.InferenceSession.create(distortionPath, opts);
+    this.aggSession = await this.ort.InferenceSession.create(aggPath, opts);
   }
 
   /**
@@ -52,9 +48,13 @@ export class UVQ {
     const dummyCF = new Tensor("float32", new Float32Array(1 * 128 * 8 * 8), [1, 128, 8, 8]);
     const dummyDF = new Tensor("float32", new Float32Array(1 * 128 * 24 * 24), [1, 128, 24, 24]);
 
-    await this.contentSession.run({ input: dummyContent });
-    await this.distortionSession.run({ input: dummyPatch });
-    await this.aggSession.run({ content: dummyCF, distortion: dummyDF });
+    // Dispose output tensors to release GPU buffers before the next run.
+    const r1 = await this.contentSession.run({ input: dummyContent });
+    for (const t of Object.values(r1)) t.dispose();
+    const r2 = await this.distortionSession.run({ input: dummyPatch });
+    for (const t of Object.values(r2)) t.dispose();
+    const r3 = await this.aggSession.run({ content: dummyCF, distortion: dummyDF });
+    for (const t of Object.values(r3)) t.dispose();
   }
 
   /**
@@ -68,7 +68,9 @@ export class UVQ {
     const tensor = new Tensor("float32", inputData, [1, 3, 256, 256]);
     const result = await this.contentSession.run({ input: tensor });
     const output = result.output;
-    return { data: output.data, dims: output.dims };
+    const feat = { data: output.data, dims: Array.from(output.dims) };
+    output.dispose();
+    return feat;
   }
 
   /**
@@ -82,7 +84,9 @@ export class UVQ {
     const tensor = new Tensor("float32", patchesData, [9, 3, 360, 640]);
     const result = await this.distortionSession.run({ input: tensor });
     const patchFeatures = result.output; // (9, 128, 8, 8)
-    return this.reassemblePatches(patchFeatures.data);
+    const cpuData = patchFeatures.data;
+    patchFeatures.dispose();
+    return this.reassemblePatches(cpuData);
   }
 
   /**
@@ -97,7 +101,9 @@ export class UVQ {
     const cTensor = new Tensor("float32", contentFeat.data, contentFeat.dims);
     const dTensor = new Tensor("float32", distortionFeat.data, distortionFeat.dims);
     const result = await this.aggSession.run({ content: cTensor, distortion: dTensor });
-    return result.output.data[0];
+    const score = result.output.data[0];
+    result.output.dispose();
+    return score;
   }
 
   /**
