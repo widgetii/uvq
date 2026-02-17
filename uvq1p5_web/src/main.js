@@ -35,9 +35,9 @@ const MODEL_PATHS = [
   "models/aggregation_net.onnx",
 ];
 
-async function loadBackend(name, { warmup = true } = {}) {
+async function loadBackend(name, { warmup = true, onProgress } = {}) {
   const uvq = new UVQ(ort);
-  await uvq.load(...MODEL_PATHS, { executionProviders: [name] });
+  await uvq.load(...MODEL_PATHS, { executionProviders: [name] }, onProgress);
   if (warmup) await uvq.warmup();
   return uvq;
 }
@@ -86,27 +86,48 @@ async function init() {
     }
   }
 
+  progressContainer.style.display = "block";
+  progressBar.value = 0;
+
+  const MODEL_NAMES = ["content_net", "distortion_net", "aggregation_net"];
+  const totalSteps = (hasWebGPU ? 3 : 0) + 3; // 3 models per backend
+  let completedSteps = 0;
+
+  function onModelProgress(loaded, _total, backendName) {
+    completedSteps++;
+    setStatus(`Loading ${MODEL_NAMES[loaded - 1]} (${backendName})...`);
+    progressBar.value = (completedSteps / totalSteps) * 100;
+  }
+
   // Load WebGPU backend (skip warmup — first real inference compiles pipelines)
   if (hasWebGPU) {
-    setStatus("Loading models (webgpu backend)...");
+    setStatus("Loading models (webgpu)...");
     try {
-      backends.webgpu = await loadBackend("webgpu", { warmup: false });
+      backends.webgpu = await loadBackend("webgpu", {
+        warmup: false,
+        onProgress: (i, n) => onModelProgress(i, n, "webgpu"),
+      });
     } catch (e) {
       console.warn("WebGPU backend failed:", e);
     }
   }
 
   // Always load WASM backend
-  setStatus("Loading models (wasm backend)...");
+  setStatus("Loading models (wasm)...");
   try {
-    backends.wasm = await loadBackend("wasm");
+    backends.wasm = await loadBackend("wasm", {
+      onProgress: (i, n) => onModelProgress(i, n, "wasm"),
+    });
   } catch (e) {
     if (!backends.webgpu) {
       showError(`Failed to load models: ${e.message}`);
       setStatus("Model loading failed.");
+      progressContainer.style.display = "none";
       return;
     }
   }
+
+  progressContainer.style.display = "none";
 
   const names = Object.keys(backends);
   if (names.length === 0) {

@@ -30,12 +30,15 @@ export class UVQ {
    * @param {object} [options]                - ort.InferenceSession.SessionOptions
    * @returns {Promise<void>}
    */
-  async load(contentPath, distortionPath, aggPath, options) {
+  async load(contentPath, distortionPath, aggPath, options, onProgress) {
     const opts = options || {};
     // Create sessions sequentially — WebGPU EP does not support concurrent creation.
     this.contentSession = await this.ort.InferenceSession.create(contentPath, opts);
+    if (onProgress) onProgress(1, 3);
     this.distortionSession = await this.ort.InferenceSession.create(distortionPath, opts);
+    if (onProgress) onProgress(2, 3);
     this.aggSession = await this.ort.InferenceSession.create(aggPath, opts);
+    if (onProgress) onProgress(3, 3);
   }
 
   /**
