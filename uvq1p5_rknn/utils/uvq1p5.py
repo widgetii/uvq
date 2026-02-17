@@ -1,6 +1,9 @@
 """RKNN implementation of the UVQ 1.5 model for Rockchip RK3588S NPU.
 
 Mirrors uvq1p5_mlx/utils/uvq1p5.py but uses RKNN-Lite for inference.
+Content and distortion nets run on the NPU; the aggregation net runs on
+CPU via ONNX Runtime as a workaround for driver-level bugs on older
+rknpu drivers (e.g. 0.8.2 on BSP 5.10 kernels).
 
 Copyright 2025 Google LLC
 
@@ -23,6 +26,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 
 from rknnlite.api import RKNNLite
 
@@ -37,17 +41,27 @@ import video_reader
 
 
 class UVQ1p5:
-    """UVQ 1.5 model using RKNN-Lite for RK3588S NPU inference."""
+    """UVQ 1.5 model using RKNN-Lite for RK3588S NPU inference.
 
-    def __init__(self, models_dir=None):
+    Content and distortion feature extractors run on the NPU via RKNN-Lite.
+    The aggregation net runs on CPU via ONNX Runtime because RKNN produces
+    incorrect results for this model on older NPU drivers (0.8.x).
+    """
+
+    def __init__(self, models_dir=None, onnx_dir=None):
         if models_dir is None:
             models_dir = os.path.join(
                 os.path.dirname(__file__), "..", "models"
             )
+        if onnx_dir is None:
+            onnx_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..",
+                "uvq1p5_web", "public", "models"
+            )
 
+        # NPU models for feature extraction
         self.content_net = RKNNLite(verbose=False)
         self.distortion_net = RKNNLite(verbose=False)
-        self.aggregation_net = RKNNLite(verbose=False)
 
         ret = self.content_net.load_rknn(
             os.path.join(models_dir, "content_net.rknn"))
@@ -60,28 +74,28 @@ class UVQ1p5:
             raise RuntimeError(
                 f"Failed to load distortion_net.rknn (ret={ret})")
 
-        ret = self.aggregation_net.load_rknn(
-            os.path.join(models_dir, "aggregation_net.rknn"))
-        if ret != 0:
-            raise RuntimeError(
-                f"Failed to load aggregation_net.rknn (ret={ret})")
-
-        # Init runtimes on NPU
         for net, name in [
             (self.content_net, "content_net"),
             (self.distortion_net, "distortion_net"),
-            (self.aggregation_net, "aggregation_net"),
         ]:
             ret = net.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO)
             if ret != 0:
                 raise RuntimeError(
                     f"Failed to init runtime for {name} (ret={ret})")
 
+        # Aggregation via ONNX Runtime on CPU (workaround for NPU driver bug)
+        agg_onnx_path = os.path.join(onnx_dir, "aggregation_net.onnx")
+        if not os.path.isfile(agg_onnx_path):
+            raise RuntimeError(
+                f"aggregation_net.onnx not found at {agg_onnx_path}. "
+                f"Run scripts/export_onnx.py first.")
+        self.aggregation_sess = ort.InferenceSession(
+            agg_onnx_path, providers=["CPUExecutionProvider"])
+
     def release(self):
         """Release RKNN resources."""
         self.content_net.release()
         self.distortion_net.release()
-        self.aggregation_net.release()
 
     def _process_frame(self, frame_nchw):
         """Process a single frame through the three-net pipeline.
@@ -128,10 +142,11 @@ class UVQ1p5:
         patch_feats = np.transpose(patch_feats, (2, 0, 3, 1, 4))
         distortion_feat = patch_feats.reshape(1, 128, 24, 24)
 
-        # --- Aggregation ---
-        score = self.aggregation_net.inference(
-            inputs=[content_feat, distortion_feat],
-            data_format='nchw')[0]  # (1, 1)
+        # --- Aggregation (ONNX Runtime on CPU) ---
+        score = self.aggregation_sess.run(
+            None,
+            {"content": content_feat, "distortion": distortion_feat},
+        )[0]  # (1, 1)
 
         return float(score.flatten()[0])
 

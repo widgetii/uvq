@@ -29,6 +29,7 @@ onnx = [
 ]
 rknn = [
     "opencv-python>=4.8.0",
+    "onnxruntime>=1.17.0",
 ]
 
 [tool.uv]

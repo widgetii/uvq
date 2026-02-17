@@ -5,9 +5,11 @@ is designed to run on the target device (Orange Pi 5 Plus / RK3588S) where
 PyTorch is not installed.  The expected score is read from reference.json,
 which is generated on the PC by scripts/export_rknn.py alongside the .rknn
 model files.
+
+The test uses the same hybrid pipeline as the production code: content and
+distortion nets on NPU via RKNN-Lite, aggregation net on CPU via ONNX Runtime.
 """
 
-import glob
 import json
 import os
 
@@ -20,22 +22,34 @@ try:
 except ImportError:
     HAS_RKNN = False
 
+try:
+    import onnxruntime as ort
+    HAS_ORT = True
+except ImportError:
+    HAS_ORT = False
+
 rknn_installed = pytest.mark.skipif(
     not HAS_RKNN,
     reason="rknn-toolkit-lite2 is not installed",
 )
 
-npu_available = pytest.mark.skipif(
-    not glob.glob("/dev/rknpu*"),
-    reason="NPU driver not loaded (no /dev/rknpu* device)",
+ort_installed = pytest.mark.skipif(
+    not HAS_ORT,
+    reason="onnxruntime is not installed",
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RKNN_MODELS_DIR = os.path.join(REPO_ROOT, "uvq1p5_rknn", "models")
+ONNX_MODELS_DIR = os.path.join(REPO_ROOT, "uvq1p5_web", "public", "models")
 
 rknn_models_exist = pytest.mark.skipif(
     not os.path.isfile(os.path.join(RKNN_MODELS_DIR, "content_net.rknn")),
     reason="RKNN models not exported (run scripts/export_rknn.py first)",
+)
+
+onnx_agg_exists = pytest.mark.skipif(
+    not os.path.isfile(os.path.join(ONNX_MODELS_DIR, "aggregation_net.onnx")),
+    reason="aggregation_net.onnx not found (run scripts/export_onnx.py first)",
 )
 
 reference_exists = pytest.mark.skipif(
@@ -61,13 +75,18 @@ def _load_rknn_session(model_name):
 
 
 @rknn_installed
-@npu_available
+@ort_installed
 @rknn_models_exist
+@onnx_agg_exists
 @reference_exists
 @pytest.mark.slow
 @pytest.mark.rknn
 class TestRKNNCrossBackendConsistency:
-    """Compare RKNN NPU output against a PyTorch reference score.
+    """Compare hybrid RKNN+ONNX pipeline against a PyTorch reference score.
+
+    Content and distortion nets run on the NPU via RKNN-Lite.  The
+    aggregation net runs on CPU via ONNX Runtime (workaround for NPU driver
+    bugs on older rknpu drivers like 0.8.2).
 
     The reference was generated on the PC during scripts/export_rknn.py using
     the same numpy seed and pre-processed inputs (content 256x256, distortion
@@ -84,17 +103,23 @@ class TestRKNNCrossBackendConsistency:
     def rknn_sessions(self):
         content = _load_rknn_session("content_net.rknn")
         distortion = _load_rknn_session("distortion_net.rknn")
-        aggregation = _load_rknn_session("aggregation_net.rknn")
-        yield content, distortion, aggregation
+        yield content, distortion
         content.release()
         distortion.release()
-        aggregation.release()
 
-    def _run_rknn_pipeline(self, rknn_sessions, content_input, patches_input):
-        """Run the three RKNN models with pre-processed inputs."""
-        content_sess, distortion_sess, aggregation_sess = rknn_sessions
+    @pytest.fixture(scope="class")
+    def aggregation_sess(self):
+        return ort.InferenceSession(
+            os.path.join(ONNX_MODELS_DIR, "aggregation_net.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
 
-        # Content features
+    def _run_pipeline(self, rknn_sessions, aggregation_sess,
+                      content_input, patches_input):
+        """Run content/distortion on NPU, aggregation on CPU."""
+        content_sess, distortion_sess = rknn_sessions
+
+        # Content features (NPU)
         content_feat = content_sess.inference(
             inputs=[content_input],
             data_format='nchw')[0]  # (1, 128, 8, 8)
@@ -113,15 +138,17 @@ class TestRKNNCrossBackendConsistency:
         patch_feats = np.transpose(patch_feats, (2, 0, 3, 1, 4))
         distortion_feat = patch_feats.reshape(1, 128, 24, 24)
 
-        # Aggregation
-        score = aggregation_sess.inference(
-            inputs=[content_feat, distortion_feat],
-            data_format='nchw')[0]  # (1, 1)
+        # Aggregation (CPU via ONNX Runtime)
+        score = aggregation_sess.run(
+            None,
+            {"content": content_feat, "distortion": distortion_feat},
+        )[0]  # (1, 1)
 
         return float(score.flatten()[0])
 
-    def test_score_matches_reference(self, reference, rknn_sessions):
-        """RKNN NPU score should match pre-computed PyTorch reference."""
+    def test_score_matches_reference(self, reference, rknn_sessions,
+                                     aggregation_sess):
+        """Hybrid RKNN+ONNX score should match pre-computed PyTorch reference."""
         # Regenerate the same deterministic inputs used by export_rknn.py
         np.random.seed(reference["numpy_seed"])
         content_input = np.random.randn(
@@ -129,10 +156,11 @@ class TestRKNNCrossBackendConsistency:
         patches_input = np.random.randn(
             *reference["patches_input_shape"]).astype(np.float32)
 
-        rknn_score = self._run_rknn_pipeline(
-            rknn_sessions, content_input, patches_input)
+        score = self._run_pipeline(
+            rknn_sessions, aggregation_sess,
+            content_input, patches_input)
         ref_score = reference["score"]
 
-        assert rknn_score == pytest.approx(ref_score, abs=0.05), (
-            f"RKNN score {rknn_score} vs PyTorch reference {ref_score}"
+        assert score == pytest.approx(ref_score, abs=0.05), (
+            f"Hybrid RKNN+ONNX score {score} vs PyTorch reference {ref_score}"
         )
