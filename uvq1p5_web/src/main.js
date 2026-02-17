@@ -67,6 +67,26 @@ async function initDecoders(file) {
   return { vidDecoder, wcDecoder, info };
 }
 
+const DECODE_REPS = 3;
+
+function median(arr) {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** Decode frame t with decoder `reps` times, return { canvas, time: median ms }. */
+async function benchDecode(decoder, t, reps) {
+  const times = [];
+  let canvas;
+  for (let r = 0; r < reps; r++) {
+    const start = performance.now();
+    canvas = await decoder.decodeFrame(t);
+    times.push(performance.now() - start);
+  }
+  return { canvas, time: median(times) };
+}
+
 async function init() {
   const backends = {}; // { name: UVQ instance }
 
@@ -150,23 +170,24 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
     return;
   }
 
+  // Warmup: decode frame 0 with both decoders (untimed) to prime pipelines
+  setStatus("Warming up decoders...");
+  await vidDecoder.decodeFrame(0);
+  if (wcDecoder) await wcDecoder.decodeFrame(0);
+
   setStatus(`Processing ${duration} frame(s) on both backends...`);
 
   const frames = [];
   const t0 = performance.now();
 
   for (let t = 0; t < duration; t++) {
-    // Decode with <video> element
-    const vidStart = performance.now();
-    const vidCanvas = await vidDecoder.decodeFrame(t);
-    const vidTime = performance.now() - vidStart;
+    // Decode with <video> element (median of DECODE_REPS runs)
+    const { canvas: vidCanvas, time: vidTime } = await benchDecode(vidDecoder, t, DECODE_REPS);
 
-    // Decode with WebCodecs (timing only if available)
+    // Decode with WebCodecs (median of DECODE_REPS runs, if available)
     let wcTime = null;
     if (wcDecoder) {
-      const wcStart = performance.now();
-      await wcDecoder.decodeFrame(t);
-      wcTime = performance.now() - wcStart;
+      ({ time: wcTime } = await benchDecode(wcDecoder, t, DECODE_REPS));
     }
 
     const { content, patches } = preprocessFrame(vidCanvas);
@@ -202,7 +223,7 @@ async function processVideoCompare(uvqGpu, uvqWasm, file) {
   scoreEl.textContent = avgGpu.toFixed(3);
   let timing =
     `${duration} frames in ${(elapsed / 1000).toFixed(1)}s — ` +
-    `decode: <video> ${(totalVidDecode / 1000).toFixed(2)}s`;
+    `decode (median of ${DECODE_REPS}): <video> ${(totalVidDecode / 1000).toFixed(2)}s`;
   if (totalWcDecode != null) {
     const decodeSpeedup = totalVidDecode / totalWcDecode;
     timing += `, WebCodecs ${(totalWcDecode / 1000).toFixed(2)}s (${decodeSpeedup.toFixed(1)}x)`;
@@ -261,23 +282,24 @@ async function processVideoSingle(uvq, backendName, file) {
     return;
   }
 
+  // Warmup: decode frame 0 with both decoders (untimed) to prime pipelines
+  setStatus("Warming up decoders...");
+  await vidDecoder.decodeFrame(0);
+  if (wcDecoder) await wcDecoder.decodeFrame(0);
+
   setStatus(`Processing ${duration} frame(s) (${backendName})...`);
 
   const frames = [];
   const t0 = performance.now();
 
   for (let t = 0; t < duration; t++) {
-    // Decode with <video> element
-    const vidStart = performance.now();
-    const vidCanvas = await vidDecoder.decodeFrame(t);
-    const vidTime = performance.now() - vidStart;
+    // Decode with <video> element (median of DECODE_REPS runs)
+    const { canvas: vidCanvas, time: vidTime } = await benchDecode(vidDecoder, t, DECODE_REPS);
 
-    // Decode with WebCodecs (timing only if available)
+    // Decode with WebCodecs (median of DECODE_REPS runs, if available)
     let wcTime = null;
     if (wcDecoder) {
-      const wcStart = performance.now();
-      await wcDecoder.decodeFrame(t);
-      wcTime = performance.now() - wcStart;
+      ({ time: wcTime } = await benchDecode(wcDecoder, t, DECODE_REPS));
     }
 
     const inferStart = performance.now();
@@ -303,7 +325,7 @@ async function processVideoSingle(uvq, backendName, file) {
   let timing =
     `${duration} frames in ${(elapsed / 1000).toFixed(1)}s ` +
     `(${(elapsed / duration).toFixed(0)} ms/frame, ${backendName}) — ` +
-    `decode: <video> ${(totalVidDecode / 1000).toFixed(2)}s`;
+    `decode (median of ${DECODE_REPS}): <video> ${(totalVidDecode / 1000).toFixed(2)}s`;
   if (totalWcDecode != null) {
     const decodeSpeedup = totalVidDecode / totalWcDecode;
     timing += `, WebCodecs ${(totalWcDecode / 1000).toFixed(2)}s (${decodeSpeedup.toFixed(1)}x)`;
